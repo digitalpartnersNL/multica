@@ -245,6 +245,63 @@ func TestHeadShaDedup_RepushInvalidatesDedup(t *testing.T) {
 	}
 }
 
+// A dedup miss must also be insertable. The pending unique index is still
+// keyed on (issue_id, agent_id), so merely making the read-side dedup SHA-aware
+// is insufficient: without an atomic stale-task supersede, the B insert loses
+// to the queued A row and no review for B is created.
+func TestHeadShaDedup_RepushAtomicallySupersedesQueuedOldHead(t *testing.T) {
+	ctx := context.Background()
+	pool := newHeadShaDedupPool(t)
+	q := db.New(pool)
+	fx := createHeadShaDedupFixture(t, ctx, pool, shaA, "open")
+
+	enqueueReviewTask(t, ctx, q, fx, shaA)
+	if _, err := pool.Exec(ctx, `
+		UPDATE github_pull_request SET head_sha = $1, pr_updated_at = now()
+		WHERE workspace_id = (SELECT workspace_id FROM issue WHERE id = $2)
+	`, shaB, util.UUIDToString(fx.issueID)); err != nil {
+		t.Fatalf("advance PR head: %v", err)
+	}
+
+	svc := NewTaskService(q, pool, nil, events.New())
+	if _, err := svc.createAgentTask(ctx, db.CreateAgentTaskParams{
+		AgentID:   fx.agentID,
+		RuntimeID: fx.runtimeID,
+		IssueID:   fx.issueID,
+		Priority:  0,
+		HeadSha:   pgtype.Text{String: shaB, Valid: true},
+	}); err != nil {
+		t.Fatalf("enqueue review for advanced head B: %v", err)
+	}
+
+	rows, err := pool.Query(ctx, `
+		SELECT status, COALESCE(context->>'head_sha', '')
+		FROM agent_task_queue
+		WHERE issue_id = $1 AND agent_id = $2
+		ORDER BY created_at
+	`, util.UUIDToString(fx.issueID), util.UUIDToString(fx.agentID))
+	if err != nil {
+		t.Fatalf("list review tasks: %v", err)
+	}
+	defer rows.Close()
+
+	type taskState struct{ status, headSha string }
+	var got []taskState
+	for rows.Next() {
+		var state taskState
+		if err := rows.Scan(&state.status, &state.headSha); err != nil {
+			t.Fatalf("scan review task: %v", err)
+		}
+		got = append(got, state)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate review tasks: %v", err)
+	}
+	if len(got) != 2 || got[0] != (taskState{status: "cancelled", headSha: shaA}) || got[1] != (taskState{status: "queued", headSha: shaB}) {
+		t.Fatalf("review task lifecycle = %#v, want [cancelled/A queued/B]", got)
+	}
+}
+
 // Behavior 3: same-SHA re-requests still dedup, so an unchanged HEAD does not
 // spawn wasteful duplicate reviewer runs.
 func TestHeadShaDedup_SameShaStillDedups(t *testing.T) {

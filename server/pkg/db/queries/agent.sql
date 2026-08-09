@@ -309,6 +309,21 @@ VALUES (
 )
 RETURNING *;
 
+-- name: SupersedePendingReviewTaskForNewHead :many
+-- A pending review for an older commit cannot occupy the unique
+-- (issue_id, agent_id) queue slot when the linked PR has advanced. Call this
+-- in the same transaction immediately before CreateAgentTask. The non-empty
+-- guard preserves legacy dedup for issues without a linked PR; IS DISTINCT
+-- FROM also retires pre-head_sha rows safely.
+UPDATE agent_task_queue
+SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
+WHERE issue_id = @issue_id
+  AND agent_id = @agent_id
+  AND status IN ('queued', 'dispatched')
+  AND COALESCE(sqlc.narg('head_sha')::text, '') <> ''
+  AND context->>'head_sha' IS DISTINCT FROM sqlc.narg('head_sha')::text
+RETURNING *;
+
 -- name: CreateQuickCreateTask :one
 -- Quick-create tasks have no issue / chat / autopilot link; the entire job
 -- description (prompt, requester, workspace) lives in context JSONB. The

@@ -1003,6 +1003,51 @@ func (s *TaskService) ResolveIssueReviewSHAParam(ctx context.Context, issueID pg
 	return headShaText(s.ResolveIssueReviewSHA(ctx, issueID))
 }
 
+// createAgentTask replaces a queued/dispatched review for an older PR head and
+// inserts the new-head task in one transaction. The existing pending unique
+// index remains the final race guard for concurrent same-head requests.
+func (s *TaskService) createAgentTask(ctx context.Context, params db.CreateAgentTaskParams) (db.AgentTaskQueue, error) {
+	if !params.HeadSha.Valid || strings.TrimSpace(params.HeadSha.String) == "" {
+		return s.Queries.CreateAgentTask(ctx, params)
+	}
+	if s.TxStarter == nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("create review task: transaction starter is unavailable")
+	}
+
+	tx, err := s.TxStarter.Begin(ctx)
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("begin review task transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	qtx := s.Queries.WithTx(tx)
+	cancelled, err := qtx.SupersedePendingReviewTaskForNewHead(ctx, db.SupersedePendingReviewTaskForNewHeadParams{
+		IssueID: params.IssueID,
+		AgentID: params.AgentID,
+		HeadSha: params.HeadSha,
+	})
+	if err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("supersede stale review task: %w", err)
+	}
+	task, err := qtx.CreateAgentTask(ctx, params)
+	if err != nil {
+		return db.AgentTaskQueue{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("commit review task transaction: %w", err)
+	}
+
+	if len(cancelled) > 0 {
+		slog.Info("stale review task superseded after PR head advanced",
+			"issue_id", util.UUIDToString(params.IssueID),
+			"agent_id", util.UUIDToString(params.AgentID),
+			"head_sha", params.HeadSha.String,
+			"cancelled_count", len(cancelled))
+		s.BroadcastCancelledTasks(ctx, cancelled)
+	}
+	return task, nil
+}
+
 func (s *TaskService) enqueueIssueTask(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID) (db.AgentTaskQueue, error) {
 	return s.enqueueIssueTaskWithCommentPlan(ctx, issue, triggerCommentID, nil, forceFreshSession, handoffNote, actorUserID, rerunOfTaskID)
 }
@@ -1043,7 +1088,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
-	task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
+	task, err := s.createAgentTask(ctx, db.CreateAgentTaskParams{
 		AgentID:              issue.AssigneeID,
 		RuntimeID:            agent.RuntimeID,
 		IssueID:              issue.ID,
@@ -1160,7 +1205,7 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
-	task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
+	task, err := s.createAgentTask(ctx, db.CreateAgentTaskParams{
 		AgentID:              agentID,
 		RuntimeID:            agent.RuntimeID,
 		IssueID:              issue.ID,
