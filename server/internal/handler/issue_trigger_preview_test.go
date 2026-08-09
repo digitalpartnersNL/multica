@@ -287,6 +287,98 @@ func TestUpdateIssueSuppressRunSkipsEnqueue(t *testing.T) {
 	}
 }
 
+// A write that persisted its issue transition but failed to enqueue the run
+// must not answer 200. The response is explicitly retryable and the test pins
+// the actual persisted state so clients are never left guessing whether the
+// status mutation itself committed.
+func TestUpdateIssueRunEnqueueFailureIsVisible(t *testing.T) {
+	agentID := seededReadyAgentID(t)
+	issue := createIssueForTest(t, map[string]any{
+		"title":         "visible enqueue failure",
+		"status":        "backlog",
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	seedDupRacePR(t, issue.ID, 999421)
+
+	// Force the activation enqueue to fail after WillEnqueueRun has promised it.
+	// Linked-PR activations require a transaction, so removing the transaction
+	// starter is a deterministic service failpoint without corrupting Postgres.
+	originalTxStarter := testHandler.TaskService.TxStarter
+	testHandler.TaskService.TxStarter = nil
+	t.Cleanup(func() { testHandler.TaskService.TxStarter = originalTxStarter })
+
+	w := httptest.NewRecorder()
+	req := withURLParam(newRequest("PUT", "/api/issues/"+issue.ID, map[string]any{"status": "todo"}), "id", issue.ID)
+	testHandler.UpdateIssue(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("UpdateIssue enqueue failure: got %d %s, want 503", w.Code, w.Body.String())
+	}
+
+	var storedStatus string
+	if err := testPool.QueryRow(context.Background(), `SELECT status FROM issue WHERE id = $1`, issue.ID).Scan(&storedStatus); err != nil {
+		t.Fatalf("read persisted issue status: %v", err)
+	}
+	if storedStatus != "todo" {
+		t.Fatalf("persisted issue status = %q, want todo", storedStatus)
+	}
+	if got := taskCountFor(t, issue.ID, agentID); got != 0 {
+		t.Fatalf("failed enqueue created %d tasks, want 0", got)
+	}
+}
+
+func TestUpdateIssueStatusActivationConflictPreservesCommentTask(t *testing.T) {
+	agentID := seededReadyAgentID(t)
+	issue := createIssueForTest(t, map[string]any{
+		"title":         "comment blocker remains durable",
+		"status":        "backlog",
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	seedDupRacePR(t, issue.ID, 999422)
+
+	var runtimeID, commentID, taskID string
+	if err := testPool.QueryRow(context.Background(), `SELECT runtime_id FROM agent WHERE id = $1`, agentID).Scan(&runtimeID); err != nil {
+		t.Fatalf("load agent runtime: %v", err)
+	}
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content)
+		VALUES ($1, $2, 'agent', $3, 'durable old-head comment') RETURNING id
+	`, issue.ID, testWorkspaceID, agentID).Scan(&commentID); err != nil {
+		t.Fatalf("seed comment: %v", err)
+	}
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, trigger_comment_id, status, context)
+		VALUES ($1, $2, $3, $4, 'queued', jsonb_build_object('head_sha', $5::text)) RETURNING id
+	`, agentID, runtimeID, issue.ID, commentID, dupRaceHeadA).Scan(&taskID); err != nil {
+		t.Fatalf("seed comment task: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := withURLParam(newRequest("PUT", "/api/issues/"+issue.ID, map[string]any{"status": "todo"}), "id", issue.ID)
+	testHandler.UpdateIssue(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("UpdateIssue blocked activation: got %d %s, want 409", w.Code, w.Body.String())
+	}
+
+	var storedStatus, taskStatus, storedHead, storedTrigger string
+	if err := testPool.QueryRow(context.Background(), `SELECT status FROM issue WHERE id = $1`, issue.ID).Scan(&storedStatus); err != nil {
+		t.Fatalf("read persisted issue: %v", err)
+	}
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT status, COALESCE(context->>'head_sha', ''), trigger_comment_id::text
+		FROM agent_task_queue WHERE id = $1
+	`, taskID).Scan(&taskStatus, &storedHead, &storedTrigger); err != nil {
+		t.Fatalf("read preserved task: %v", err)
+	}
+	if storedStatus != "todo" || taskStatus != "queued" || storedHead != dupRaceHeadA || storedTrigger != commentID {
+		t.Fatalf("persisted conflict state = issue:%q task:%q head:%q trigger:%q", storedStatus, taskStatus, storedHead, storedTrigger)
+	}
+	if got := taskCountFor(t, issue.ID, agentID); got != 1 {
+		t.Fatalf("blocked activation task count = %d, want only the preserved comment task", got)
+	}
+}
+
 // TestUpdateIssueHandoffNotePersistsOnTask verifies an assign carrying a
 // handoff_note writes that note onto the enqueued task (the daemon then renders
 // it), while a suppressed assign with a note enqueues nothing at all.

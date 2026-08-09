@@ -320,6 +320,12 @@ SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
 WHERE issue_id = @issue_id
   AND agent_id = @agent_id
   AND status IN ('queued', 'dispatched')
+  -- Only a plain assignment/status activation may be superseded. Comment,
+  -- coalesced-plan, and rerun rows carry durable obligations that must survive
+  -- a later status activation even when their stamped head is older.
+  AND trigger_comment_id IS NULL
+  AND cardinality(coalesced_comment_ids) = 0
+  AND rerun_of_task_id IS NULL
   AND COALESCE(sqlc.narg('head_sha')::text, '') <> ''
   AND context->>'head_sha' IS DISTINCT FROM sqlc.narg('head_sha')::text
 RETURNING *;

@@ -2976,7 +2976,15 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		},
 		h.issueTriggerWriteProbe(r, actorType, actorID, workspaceID, issue),
 	); ok && !req.SuppressRun {
-		h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.HandoffNote)
+		if err := h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.HandoffNote); err != nil {
+			slog.Error("issue updated but run enqueue failed", "issue_id", id, "error", err)
+			if errors.Is(err, service.ErrReviewActivationBlocked) {
+				writeError(w, http.StatusConflict, "issue updated; agent run is blocked by existing work, retry later")
+			} else {
+				writeError(w, http.StatusServiceUnavailable, "issue updated; agent run could not be started, retry later")
+			}
+			return
+		}
 	}
 
 	// Platform-driven parent notification: when this issue transitions into
@@ -3311,6 +3319,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	updated := 0
+	var runEnqueueFailures []string
 	// Children that transitioned into a terminal status this batch, collected so
 	// the parent/stage notification is evaluated once against the final state
 	// after the loop (MUL-4155) rather than per-child mid-batch.
@@ -3505,7 +3514,10 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			},
 			h.issueTriggerWriteProbe(r, actorType, actorID, workspaceID, issue),
 		); ok && !req.Updates.SuppressRun {
-			h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.Updates.HandoffNote)
+			if err := h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.Updates.HandoffNote); err != nil {
+				slog.Error("batch issue updated but run enqueue failed", "issue_id", issueID, "error", err)
+				runEnqueueFailures = append(runEnqueueFailures, issueID)
+			}
 		}
 
 		// No status change — not even → cancelled — cancels active tasks here,
@@ -3532,6 +3544,14 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	// of issue_ids order (MUL-4155). Best-effort; failure does not abort the
 	// batch. Single-issue UpdateIssue is unchanged and still notifies inline.
 	h.notifyParentsOfBatchChildDone(r.Context(), childDoneCompleted)
+	if len(runEnqueueFailures) > 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error":                   "issues updated; one or more agent runs could not be started, retry later",
+			"updated":                 updated,
+			"run_enqueue_failure_ids": runEnqueueFailures,
+		})
+		return
+	}
 
 	slog.Info("batch update issues", append(logger.RequestAttrs(r), "count", updated)...)
 	writeJSON(w, http.StatusOK, map[string]any{"updated": updated})

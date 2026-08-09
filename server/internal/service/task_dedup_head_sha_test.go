@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -270,7 +271,7 @@ func TestHeadShaDedup_RepushAtomicallySupersedesQueuedOldHead(t *testing.T) {
 		IssueID:   fx.issueID,
 		Priority:  0,
 		HeadSha:   pgtype.Text{String: shaB, Valid: true},
-	}); err != nil {
+	}, true); err != nil {
 		t.Fatalf("enqueue review for advanced head B: %v", err)
 	}
 
@@ -299,6 +300,102 @@ func TestHeadShaDedup_RepushAtomicallySupersedesQueuedOldHead(t *testing.T) {
 	}
 	if len(got) != 2 || got[0] != (taskState{status: "cancelled", headSha: shaA}) || got[1] != (taskState{status: "queued", headSha: shaB}) {
 		t.Fatalf("review task lifecycle = %#v, want [cancelled/A queued/B]", got)
+	}
+}
+
+// The head passed by the caller is only a preflight snapshot. A push can land
+// before the enqueue transaction begins, so the transaction must re-read the
+// linked PR and stamp that authoritative head instead of persisting the stale
+// caller value.
+func TestHeadShaDedup_EnqueueTransactionRefreshesAdvancedHead(t *testing.T) {
+	ctx := context.Background()
+	pool := newHeadShaDedupPool(t)
+	q := db.New(pool)
+	fx := createHeadShaDedupFixture(t, ctx, pool, shaB, "open")
+
+	// The caller resolved B. Before its enqueue transaction starts, another
+	// request advances the linked PR to C.
+	const shaC = "cccccccccccccccccccccccccccccccccccccccc"
+	if _, err := pool.Exec(ctx, `
+		UPDATE github_pull_request SET head_sha = $1, pr_updated_at = now()
+		WHERE workspace_id = (SELECT workspace_id FROM issue WHERE id = $2)
+	`, shaC, util.UUIDToString(fx.issueID)); err != nil {
+		t.Fatalf("advance PR head B to C: %v", err)
+	}
+
+	svc := NewTaskService(q, pool, nil, events.New())
+	task, err := svc.createAgentTask(ctx, db.CreateAgentTaskParams{
+		AgentID:   fx.agentID,
+		RuntimeID: fx.runtimeID,
+		IssueID:   fx.issueID,
+		Priority:  0,
+		HeadSha:   pgtype.Text{String: shaB, Valid: true},
+	}, true)
+	if err != nil {
+		t.Fatalf("enqueue review after concurrent push: %v", err)
+	}
+
+	var storedHead string
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(context->>'head_sha', '') FROM agent_task_queue WHERE id = $1`, util.UUIDToString(task.ID)).Scan(&storedHead); err != nil {
+		t.Fatalf("read stored review head: %v", err)
+	}
+	if storedHead != shaC {
+		t.Fatalf("stored review head = %q, want transaction-current head %q", storedHead, shaC)
+	}
+}
+
+// A status activation must never clear a queued comment obligation merely to
+// make room for a newer-head review. With the existing one-pending-slot
+// contract the safe outcome is a retryable conflict: the comment task remains
+// byte-for-byte planned and no success-shaped replacement is created.
+func TestHeadShaDedup_StatusActivationPreservesOldHeadCommentTask(t *testing.T) {
+	ctx := context.Background()
+	pool := newHeadShaDedupPool(t)
+	q := db.New(pool)
+	fx := createHeadShaDedupFixture(t, ctx, pool, shaB, "open")
+
+	var commentID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content)
+		SELECT $1, workspace_id, 'agent', $2, 'review the prior head comment'
+		FROM issue WHERE id = $1
+		RETURNING id
+	`, util.UUIDToString(fx.issueID), util.UUIDToString(fx.agentID)).Scan(&commentID); err != nil {
+		t.Fatalf("create trigger comment: %v", err)
+	}
+	if _, err := q.CreateAgentTask(ctx, db.CreateAgentTaskParams{
+		AgentID:          fx.agentID,
+		RuntimeID:        fx.runtimeID,
+		IssueID:          fx.issueID,
+		Priority:         0,
+		TriggerCommentID: util.MustParseUUID(commentID),
+		HeadSha:          pgtype.Text{String: shaA, Valid: true},
+	}); err != nil {
+		t.Fatalf("create old-head comment task: %v", err)
+	}
+
+	svc := NewTaskService(q, pool, nil, events.New())
+	_, err := svc.createAgentTask(ctx, db.CreateAgentTaskParams{
+		AgentID:   fx.agentID,
+		RuntimeID: fx.runtimeID,
+		IssueID:   fx.issueID,
+		Priority:  0,
+		HeadSha:   pgtype.Text{String: shaB, Valid: true},
+	}, true)
+	if !errors.Is(err, ErrReviewActivationBlocked) {
+		t.Fatalf("status activation error = %v, want ErrReviewActivationBlocked", err)
+	}
+
+	var count int
+	var status, storedHead, storedTrigger string
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) OVER (), status, COALESCE(context->>'head_sha', ''), trigger_comment_id::text
+		FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2
+	`, util.UUIDToString(fx.issueID), util.UUIDToString(fx.agentID)).Scan(&count, &status, &storedHead, &storedTrigger); err != nil {
+		t.Fatalf("read preserved comment task: %v", err)
+	}
+	if count != 1 || status != "queued" || storedHead != shaA || storedTrigger != commentID {
+		t.Fatalf("preserved task = count=%d status=%q head=%q trigger=%q, want one queued A task with trigger %q", count, status, storedHead, storedTrigger, commentID)
 	}
 }
 
