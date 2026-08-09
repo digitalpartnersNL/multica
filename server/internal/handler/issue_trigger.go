@@ -17,13 +17,16 @@ import (
 const maxPreviewTriggerIssues = 500
 
 // issueTriggerWriteProbe builds the probe the write paths feed to
-// WillEnqueueRun. The private-agent gate is already enforced at the HTTP
-// boundary (validateAssigneePair on assign) and inside enqueueSquadLeaderTask
-// (canEnqueueSquadLeader), so a write must NOT re-run or sink it — it passes
-// allow-all. The self-loop check needs the request's X-Task-ID header.
-func (h *Handler) issueTriggerWriteProbe(r *http.Request, actorType string, issue db.Issue) service.IssueTriggerProbe {
+// WillEnqueueRun. A status-only write does not pass through
+// validateAssigneePair, so the probe must enforce the invocation gate itself.
+// This also keeps write and preview decisions identical for direct agents and
+// squad leaders.
+func (h *Handler) issueTriggerWriteProbe(r *http.Request, actorType, actorID, workspaceID string, issue db.Issue) service.IssueTriggerProbe {
+	originatorUserID := h.invokeOriginatorFromRequest(r, actorType, actorID)
 	return service.IssueTriggerProbe{
-		CanAccessAgent: nil, // allow-all; gate lives at the write boundary
+		CanAccessAgent: func(agent db.Agent) bool {
+			return h.canInvokeAgent(r.Context(), agent, actorType, actorID, originatorUserID, workspaceID)
+		},
 		IsSelfLoop: func() bool {
 			return h.isAgentRunningOnIssue(r, actorType, issue)
 		},

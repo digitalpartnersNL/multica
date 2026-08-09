@@ -2974,7 +2974,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 			AssigneeChanged: assigneeChanged,
 			StatusChanged:   statusChanged,
 		},
-		h.issueTriggerWriteProbe(r, actorType, issue),
+		h.issueTriggerWriteProbe(r, actorType, actorID, workspaceID, issue),
 	); ok && !req.SuppressRun {
 		h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.HandoffNote)
 	}
@@ -3145,7 +3145,38 @@ func (h *Handler) isAgentRunningOnIssue(r *http.Request, actorType string, issue
 	if !task.IssueID.Valid {
 		return false
 	}
-	return uuidToString(task.IssueID) == uuidToString(issue.ID)
+	if uuidToString(task.IssueID) != uuidToString(issue.ID) {
+		return false
+	}
+
+	targetAgentID := issue.AssigneeID
+	if !targetAgentID.Valid {
+		return false
+	}
+	switch issue.AssigneeType.String {
+	case "agent":
+	case "squad":
+		squad, err := h.Queries.GetSquadInWorkspace(r.Context(), db.GetSquadInWorkspaceParams{
+			ID:          issue.AssigneeID,
+			WorkspaceID: issue.WorkspaceID,
+		})
+		if err != nil {
+			return false
+		}
+		targetAgentID = squad.LeaderID
+	default:
+		return false
+	}
+	if uuidToString(task.AgentID) != uuidToString(targetAgentID) {
+		return false
+	}
+
+	switch task.Status {
+	case "queued", "dispatched", "running", "waiting_local_directory", "deferred":
+		return true
+	default:
+		return false
+	}
 }
 
 // isAgentAssigneeReady checks if an issue is assigned to an active agent
@@ -3472,7 +3503,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 				AssigneeChanged: assigneeChanged,
 				StatusChanged:   statusChanged,
 			},
-			h.issueTriggerWriteProbe(r, actorType, issue),
+			h.issueTriggerWriteProbe(r, actorType, actorID, workspaceID, issue),
 		); ok && !req.Updates.SuppressRun {
 			h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.Updates.HandoffNote)
 		}
