@@ -58,25 +58,23 @@ WHERE id = $4
   AND status = $6
   AND assignee_type IS NOT DISTINCT FROM $7
   AND assignee_id IS NOT DISTINCT FROM $8
-  AND updated_at = $9
 RETURNING id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties
 `
 
 type CompensateIssueStatusAfterRunEnqueueFailureParams struct {
-	RestoreStatus       string             `json:"restore_status"`
-	RestoreAssigneeType pgtype.Text        `json:"restore_assignee_type"`
-	RestoreAssigneeID   pgtype.UUID        `json:"restore_assignee_id"`
-	IssueID             pgtype.UUID        `json:"issue_id"`
-	WorkspaceID         pgtype.UUID        `json:"workspace_id"`
-	FailedStatus        string             `json:"failed_status"`
-	FailedAssigneeType  pgtype.Text        `json:"failed_assignee_type"`
-	FailedAssigneeID    pgtype.UUID        `json:"failed_assignee_id"`
-	FailedUpdatedAt     pgtype.Timestamptz `json:"failed_updated_at"`
+	RestoreStatus       string      `json:"restore_status"`
+	RestoreAssigneeType pgtype.Text `json:"restore_assignee_type"`
+	RestoreAssigneeID   pgtype.UUID `json:"restore_assignee_id"`
+	IssueID             pgtype.UUID `json:"issue_id"`
+	WorkspaceID         pgtype.UUID `json:"workspace_id"`
+	FailedStatus        string      `json:"failed_status"`
+	FailedAssigneeType  pgtype.Text `json:"failed_assignee_type"`
+	FailedAssigneeID    pgtype.UUID `json:"failed_assignee_id"`
 }
 
 // Restore all trigger-relevant fields only when the row is still exactly the
-// write that failed to start its promised run. The full compare-and-set keeps
-// a concurrent user edit authoritative.
+// write that failed to start its promised run. Match only trigger-relevant
+// fields so an unrelated concurrent edit (for example title) is preserved.
 func (q *Queries) CompensateIssueStatusAfterRunEnqueueFailure(ctx context.Context, arg CompensateIssueStatusAfterRunEnqueueFailureParams) (Issue, error) {
 	row := q.db.QueryRow(ctx, compensateIssueStatusAfterRunEnqueueFailure,
 		arg.RestoreStatus,
@@ -87,7 +85,6 @@ func (q *Queries) CompensateIssueStatusAfterRunEnqueueFailure(ctx context.Contex
 		arg.FailedStatus,
 		arg.FailedAssigneeType,
 		arg.FailedAssigneeID,
-		arg.FailedUpdatedAt,
 	)
 	var i Issue
 	err := row.Scan(

@@ -502,6 +502,75 @@ func TestUpdateIssueRunEnqueueFailureCompensationPreservesConcurrentStatusAndAss
 	}
 }
 
+func TestUpdateIssueRunEnqueueFailureCompensatesAcrossConcurrentTitleEdit(t *testing.T) {
+	agentID := seededReadyAgentID(t)
+	issue := createIssueForTest(t, map[string]any{"title": "before title edit", "status": "backlog", "assignee_type": "agent", "assignee_id": agentID})
+	seedDupRacePR(t, issue.ID, 999427)
+	original := testHandler.TaskService.TxStarter
+	failpoint := &blockingFailTxStarter{entered: make(chan struct{}), release: make(chan struct{})}
+	testHandler.TaskService.TxStarter = failpoint
+	t.Cleanup(func() { testHandler.TaskService.TxStarter = original })
+	w, done := httptest.NewRecorder(), make(chan struct{})
+	go func() {
+		defer close(done)
+		testHandler.UpdateIssue(w, withURLParam(newRequest("PUT", "/api/issues/"+issue.ID, map[string]any{"status": "todo"}), "id", issue.ID))
+	}()
+	<-failpoint.entered
+	if _, err := testPool.Exec(context.Background(), `UPDATE issue SET title='concurrent title', updated_at=now() WHERE id=$1`, issue.ID); err != nil {
+		t.Fatalf("concurrent title edit: %v", err)
+	}
+	close(failpoint.release)
+	<-done
+	var status, title string
+	if err := testPool.QueryRow(context.Background(), `SELECT status,title FROM issue WHERE id=$1`, issue.ID).Scan(&status, &title); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != http.StatusServiceUnavailable || status != "backlog" || title != "concurrent title" {
+		t.Fatalf("single result http=%d status=%q title=%q", w.Code, status, title)
+	}
+	testHandler.TaskService.TxStarter = original
+	retry := httptest.NewRecorder()
+	testHandler.UpdateIssue(retry, withURLParam(newRequest("PUT", "/api/issues/"+issue.ID, map[string]any{"status": "todo"}), "id", issue.ID))
+	if retry.Code != http.StatusOK || taskCountFor(t, issue.ID, agentID) != 1 {
+		t.Fatalf("single retry http=%d tasks=%d", retry.Code, taskCountFor(t, issue.ID, agentID))
+	}
+}
+
+func TestBatchUpdateIssueRunEnqueueFailureCompensatesAcrossConcurrentTitleEdit(t *testing.T) {
+	agentID := seededReadyAgentID(t)
+	issue := createIssueForTest(t, map[string]any{"title": "before batch title edit", "status": "backlog", "assignee_type": "agent", "assignee_id": agentID})
+	seedDupRacePR(t, issue.ID, 999428)
+	original := testHandler.TaskService.TxStarter
+	failpoint := &blockingFailTxStarter{entered: make(chan struct{}), release: make(chan struct{})}
+	testHandler.TaskService.TxStarter = failpoint
+	t.Cleanup(func() { testHandler.TaskService.TxStarter = original })
+	body := map[string]any{"issue_ids": []string{issue.ID}, "updates": map[string]any{"status": "todo"}}
+	w, done := httptest.NewRecorder(), make(chan struct{})
+	go func() {
+		defer close(done)
+		testHandler.BatchUpdateIssues(w, newRequest("POST", "/api/issues/batch?workspace_id="+testWorkspaceID, body))
+	}()
+	<-failpoint.entered
+	if _, err := testPool.Exec(context.Background(), `UPDATE issue SET title='concurrent batch title', updated_at=now() WHERE id=$1`, issue.ID); err != nil {
+		t.Fatalf("concurrent batch title edit: %v", err)
+	}
+	close(failpoint.release)
+	<-done
+	var status, title string
+	if err := testPool.QueryRow(context.Background(), `SELECT status,title FROM issue WHERE id=$1`, issue.ID).Scan(&status, &title); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != http.StatusServiceUnavailable || status != "backlog" || title != "concurrent batch title" {
+		t.Fatalf("batch result http=%d status=%q title=%q", w.Code, status, title)
+	}
+	testHandler.TaskService.TxStarter = original
+	retry := httptest.NewRecorder()
+	testHandler.BatchUpdateIssues(retry, newRequest("POST", "/api/issues/batch?workspace_id="+testWorkspaceID, body))
+	if retry.Code != http.StatusOK || taskCountFor(t, issue.ID, agentID) != 1 {
+		t.Fatalf("batch retry http=%d tasks=%d", retry.Code, taskCountFor(t, issue.ID, agentID))
+	}
+}
+
 func TestUpdateIssueStatusActivationConflictPreservesCommentTask(t *testing.T) {
 	agentID := seededReadyAgentID(t)
 	issue := createIssueForTest(t, map[string]any{

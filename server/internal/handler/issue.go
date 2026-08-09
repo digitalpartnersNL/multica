@@ -3572,7 +3572,6 @@ func (h *Handler) compensateFailedRunMutation(ctx context.Context, previous, fai
 		FailedStatus:        failed.Status,
 		FailedAssigneeType:  failed.AssigneeType,
 		FailedAssigneeID:    failed.AssigneeID,
-		FailedUpdatedAt:     failed.UpdatedAt,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("run enqueue compensation skipped after concurrent issue update", "issue_id", uuidToString(failed.ID))
