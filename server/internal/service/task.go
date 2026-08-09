@@ -1007,7 +1007,14 @@ func (s *TaskService) ResolveIssueReviewSHAParam(ctx context.Context, issueID pg
 // inserts the new-head task in one transaction. The existing pending unique
 // index remains the final race guard for concurrent same-head requests.
 func (s *TaskService) createAgentTask(ctx context.Context, params db.CreateAgentTaskParams) (db.AgentTaskQueue, error) {
-	if !params.HeadSha.Valid || strings.TrimSpace(params.HeadSha.String) == "" {
+	// Superseding is intentionally limited to assignment/status activation.
+	// Comment enqueues and completion replays have a separate durable
+	// coalescing/hand-off contract: cancelling their blocker would fabricate a
+	// successful queue result and can discard planned-but-undelivered comments.
+	// Those paths always carry a trigger, a comment plan, or rerun lineage and
+	// must keep relying on duplicate detection plus reconciliation.
+	isIssueActivation := !params.TriggerCommentID.Valid && len(params.CoalescedCommentIds) == 0 && !params.RerunOfTaskID.Valid
+	if !isIssueActivation || !params.HeadSha.Valid || strings.TrimSpace(params.HeadSha.String) == "" {
 		return s.Queries.CreateAgentTask(ctx, params)
 	}
 	if s.TxStarter == nil {
