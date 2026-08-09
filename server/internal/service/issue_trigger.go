@@ -15,8 +15,8 @@ const (
 	// RunSourceAssign covers issue creation and assignee changes — the issue
 	// is being handed to an agent/squad. Parks silently on backlog.
 	RunSourceAssign RunEnqueueSource = "assign"
-	// RunSourceStatus covers promoting an already-assigned issue out of
-	// backlog into an active status.
+	// RunSourceStatus covers activating or reactivating an already-assigned
+	// issue by moving it to todo.
 	RunSourceStatus RunEnqueueSource = "status"
 )
 
@@ -30,8 +30,8 @@ const (
 // gate so it never leaks a private agent's readiness to a member who cannot
 // see it. A nil func is treated as allow-all.
 //
-// IsSelfLoop reports whether promoting this issue out of backlog would be the
-// calling agent re-triggering its own running task. Only the status source
+// IsSelfLoop reports whether activating this issue would be the calling agent
+// re-triggering its own running task. Only the status source
 // consults it; create and assign never do. A nil func means "not a self-loop".
 type IssueTriggerProbe struct {
 	CanAccessAgent func(agent db.Agent) bool
@@ -104,8 +104,9 @@ func (s *IssueService) WillEnqueueRun(ctx context.Context, in IssueTriggerInput,
 			return IssueRunTrigger{}, false
 		}
 		source = RunSourceAssign
-	case in.StatusChanged && in.PrevStatus == "backlog" &&
-		issue.Status != "done" && issue.Status != "cancelled":
+	case in.StatusChanged &&
+		((in.PrevStatus == "backlog" && issue.Status != "done" && issue.Status != "cancelled") ||
+			(in.PrevStatus != "todo" && issue.Status == "todo")):
 		if probe.IsSelfLoop != nil && probe.IsSelfLoop() {
 			return IssueRunTrigger{}, false
 		}

@@ -125,8 +125,9 @@ and is hidden from the PR list.
 |---|---|---|
 | Create-time: agent-assigned, non-backlog issue enqueues immediately | `server/internal/handler/issue.go:2263-2264` | new citation |
 | `shouldEnqueueAgentTask` returns false for `backlog` (parking lot) | `server/internal/handler/issue.go:2644-2648` | new citation |
-| Backlog → non-backlog (not done/cancelled) enqueues on update | `server/internal/handler/issue.go:2537-2540` | `:2523` |
-| Same contract in batch update | `server/internal/handler/issue.go:3021-3024` | new citation |
+| Backlog → non-backlog (not done/cancelled) enqueues on update | `server/internal/service/issue_trigger.go` (`WillEnqueueRun`) | central predicate |
+| Any real transition from another status → `todo` requests a reactivation run | `server/internal/service/issue_trigger.go` (`WillEnqueueRun`) | new contract |
+| Single update, batch update, and preview share the same predicate | `server/internal/handler/issue.go` (`UpdateIssue`, `BatchUpdateIssues`); `server/internal/handler/issue_trigger.go` (`PreviewIssueTrigger`) | central predicate |
 | Child → `done` notifies + wakes the parent, gated by the stage barrier | `server/internal/handler/issue_child_done.go:66` (`notifyParentOfChildDone`; doc comment at `:15`; barrier gate at `:115`) | func def `:51` |
 | Status change (incl. → `cancelled`) does NOT cancel in-flight tasks; only issue deletion does (MUL-4465) | no-cancel note in `server/internal/handler/issue.go:2652-2658` (`UpdateIssue`) and `:3170-3171` (`BatchUpdateIssues`); deletion still cancels at `:2863` (`DeleteIssue`) / `:3239` (`BatchDeleteIssues`) via `CancelTasksForIssue` (`server/internal/service/task.go:1229`) | new citation |
 | `StartTask` / `CompleteTask` do not write issue status (agent CLI owns progress) | `server/internal/service/task.go` (`StartTask` / `CompleteTask` comments) | new citation |
@@ -135,8 +136,10 @@ and is hidden from the PR list.
 
 Creation with `--status todo` (or any non-backlog status) on an agent-assigned
 issue fires the agent immediately; `--status backlog` parks it with the assignee
-set but no trigger. Promoting `backlog → todo` later fires it then (update path,
-line 2537).
+set but no trigger. Promoting backlog to any non-terminal active status fires it.
+Returning rejected work from `in_review` to `todo` requests a fresh run through
+the same predicate; pending-run deduplication and the same-issue self-loop guard
+still apply.
 
 Moving an issue to `cancelled` used to call `CancelTasksForIssue` and stop every
 active task on it (the old #940 behavior). MUL-4465 removed that from both
@@ -195,6 +198,6 @@ grep -n 'ListPullRequestsForIssue'           cmd/server/router.go internal/handl
 grep -n 'func issuePullRequestRowToResponse\|type GitHubPullRequestResponse struct\|func derivePRState\|func extractIdentifiers\|func extractClosingIdentifiers\|closingIdentifierRe' internal/handler/github.go
 grep -n 'extractIdentifiers(\|extractClosingIdentifiers(\|derivePRState(' internal/handler/github.go
 grep -n 'qualifyingIdents\|reference_only\|ReferenceOnly' internal/handler/github.go pkg/db/queries/github.sql
-grep -n 'prevIssue.Status == "backlog"\|func (h \*Handler) shouldEnqueueAgentTask' internal/handler/issue.go
+grep -n 'func (s \*IssueService) WillEnqueueRun' internal/service/issue_trigger.go
 grep -n 'func notifyParentOfChildDone'       internal/handler/issue_child_done.go
 ```

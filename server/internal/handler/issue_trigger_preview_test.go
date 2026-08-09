@@ -186,6 +186,73 @@ func TestPreviewIssueTrigger_MatchesWritePath(t *testing.T) {
 	}
 }
 
+// TestPreviewIssueTrigger_InReviewToTodoIsReactivation keeps preview and write
+// behavior aligned for rejected verification rounds. A reviewer returning an
+// assigned issue to todo must visibly promise a fresh execution run.
+func TestPreviewIssueTrigger_InReviewToTodoIsReactivation(t *testing.T) {
+	agentID := seededReadyAgentID(t)
+	issue := createIssueForTest(t, map[string]any{
+		"title":  "preview rejected verification rework",
+		"status": "in_review",
+	})
+
+	// Assigning an active issue starts an initial run. Mark it terminal so a
+	// pending-run dedup cannot hide the reactivation decision under test.
+	w := httptest.NewRecorder()
+	req := withURLParam(newRequest("PUT", "/api/issues/"+issue.ID, map[string]any{
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	}), "id", issue.ID)
+	testHandler.UpdateIssue(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("assign issue: %d %s", w.Code, w.Body.String())
+	}
+	if _, err := testPool.Exec(context.Background(), `
+		UPDATE agent_task_queue
+		SET status = 'completed', completed_at = now()
+		WHERE issue_id = $1 AND agent_id = $2
+	`, issue.ID, agentID); err != nil {
+		t.Fatalf("complete initial task: %v", err)
+	}
+
+	resp := previewIssueTrigger(t, map[string]any{
+		"issue_ids": []string{issue.ID},
+		"status":    "todo",
+	})
+	if resp.TotalCount != 1 {
+		t.Fatalf("expected reactivation preview to promise 1 run, got %+v", resp)
+	}
+	if resp.Triggers[0].Source != "status" {
+		t.Fatalf("expected source=status, got %q", resp.Triggers[0].Source)
+	}
+}
+
+func TestPreviewIssueTrigger_InReviewToTodoDeduplicatesPendingRun(t *testing.T) {
+	agentID := seededReadyAgentID(t)
+	issue := createIssueForTest(t, map[string]any{
+		"title":  "preview rework with pending run",
+		"status": "in_review",
+	})
+
+	w := httptest.NewRecorder()
+	req := withURLParam(newRequest("PUT", "/api/issues/"+issue.ID, map[string]any{
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	}), "id", issue.ID)
+	testHandler.UpdateIssue(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("assign issue: %d %s", w.Code, w.Body.String())
+	}
+
+	resp := previewIssueTrigger(t, map[string]any{
+		"issue_ids": []string{issue.ID},
+		"status":    "todo",
+	})
+	if resp.TotalCount != 0 {
+		t.Fatalf("pending run must deduplicate reactivation, got %+v", resp)
+	}
+}
+
 // TestUpdateIssueSuppressRunSkipsEnqueue verifies suppress_run applies the
 // assignee change but starts no run, while the same write without it does.
 func TestUpdateIssueSuppressRunSkipsEnqueue(t *testing.T) {
