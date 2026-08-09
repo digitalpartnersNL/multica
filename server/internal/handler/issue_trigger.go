@@ -23,7 +23,7 @@ const maxPreviewTriggerIssues = 500
 // This also keeps write and preview decisions identical for direct agents and
 // squad leaders.
 func (h *Handler) issueTriggerWriteProbe(r *http.Request, actorType, actorID, workspaceID string, issue db.Issue) service.IssueTriggerProbe {
-	originatorUserID := h.invokeOriginatorFromRequest(r, actorType, actorID)
+	originatorUserID := h.issueTriggerOriginator(r.Context(), actorType, actorID, issue)
 	return service.IssueTriggerProbe{
 		CanAccessAgent: func(agent db.Agent) bool {
 			return h.canInvokeAgent(r.Context(), agent, actorType, actorID, originatorUserID, workspaceID)
@@ -39,7 +39,7 @@ func (h *Handler) issueTriggerWriteProbe(r *http.Request, actorType, actorID, wo
 // readiness to a member who cannot see it — matching validateAssigneePair /
 // canEnqueueSquadLeader) and the same self-loop guard.
 func (h *Handler) issueTriggerPreviewProbe(r *http.Request, actorType, actorID, workspaceID string, issue db.Issue) service.IssueTriggerProbe {
-	originatorUserID := h.invokeOriginatorFromRequest(r, actorType, actorID)
+	originatorUserID := h.issueTriggerOriginator(r.Context(), actorType, actorID, issue)
 	return service.IssueTriggerProbe{
 		CanAccessAgent: func(agent db.Agent) bool {
 			return h.canInvokeAgent(r.Context(), agent, actorType, actorID, originatorUserID, workspaceID)
@@ -48,6 +48,17 @@ func (h *Handler) issueTriggerPreviewProbe(r *http.Request, actorType, actorID, 
 			return h.isAgentRunningOnIssue(r, actorType, issue)
 		},
 	}
+}
+
+// issueTriggerOriginator returns the human identity the future queued task
+// will actually persist. Authorization must judge that same identity, rather
+// than the request task's originator, or preview/write can approve a squad run
+// that enqueueSquadLeaderTask subsequently rejects against issue provenance.
+func (h *Handler) issueTriggerOriginator(ctx context.Context, actorType, actorID string, issue db.Issue) string {
+	if actorType == "member" {
+		return actorID
+	}
+	return uuidToString(h.TaskService.OriginatorForIssueTask(ctx, issue, pgtype.UUID{}))
 }
 
 // dispatchIssueRun executes the enqueue side effect for a decision produced by
