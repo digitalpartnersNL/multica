@@ -587,6 +587,10 @@ var ErrDuplicatePendingTask = errors.New("a pending task for this issue and agen
 // response claiming that a new review run started.
 var ErrReviewActivationBlocked = errors.New("review activation is blocked by an existing durable task")
 
+var errReviewHeadChangedDuringEnqueue = errors.New("review head changed during enqueue")
+
+const maxReviewHeadEnqueueAttempts = 3
+
 // isDuplicatePendingTaskErr reports whether err is the unique-index violation on
 // idx_one_pending_task_per_issue_agent (a concurrent enqueue won the race).
 func isDuplicatePendingTaskErr(err error) bool {
@@ -1026,10 +1030,34 @@ func (s *TaskService) createAgentTask(ctx context.Context, params db.CreateAgent
 	if s.TxStarter == nil {
 		return db.AgentTaskQueue{}, fmt.Errorf("create review task: transaction starter is unavailable")
 	}
+	for attempt := 1; attempt <= maxReviewHeadEnqueueAttempts; attempt++ {
+		task, cancelled, err := s.createReviewActivationAttempt(ctx, params)
+		if errors.Is(err, errReviewHeadChangedDuringEnqueue) {
+			slog.Info("review head changed during enqueue; retrying",
+				"issue_id", util.UUIDToString(params.IssueID),
+				"agent_id", util.UUIDToString(params.AgentID),
+				"attempt", attempt)
+			continue
+		}
+		if err != nil {
+			return db.AgentTaskQueue{}, err
+		}
+		if len(cancelled) > 0 {
+			slog.Info("stale review task superseded after PR head advanced",
+				"issue_id", util.UUIDToString(params.IssueID),
+				"agent_id", util.UUIDToString(params.AgentID),
+				"cancelled_count", len(cancelled))
+			s.BroadcastCancelledTasks(ctx, cancelled)
+		}
+		return task, nil
+	}
+	return db.AgentTaskQueue{}, fmt.Errorf("%w after %d attempts", errReviewHeadChangedDuringEnqueue, maxReviewHeadEnqueueAttempts)
+}
 
+func (s *TaskService) createReviewActivationAttempt(ctx context.Context, params db.CreateAgentTaskParams) (db.AgentTaskQueue, []db.AgentTaskQueue, error) {
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
-		return db.AgentTaskQueue{}, fmt.Errorf("begin review task transaction: %w", err)
+		return db.AgentTaskQueue{}, nil, fmt.Errorf("begin review task transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
@@ -1039,7 +1067,7 @@ func (s *TaskService) createAgentTask(ctx context.Context, params db.CreateAgent
 	// both the supersede decision and the new review task.
 	currentHead, headErr := qtx.GetIssueReviewHeadSha(ctx, params.IssueID)
 	if headErr != nil && !errors.Is(headErr, pgx.ErrNoRows) {
-		return db.AgentTaskQueue{}, fmt.Errorf("resolve transaction-current review head: %w", headErr)
+		return db.AgentTaskQueue{}, nil, fmt.Errorf("resolve transaction-current review head: %w", headErr)
 	}
 	params.HeadSha = headShaText(currentHead)
 	cancelled, err := qtx.SupersedePendingReviewTaskForNewHead(ctx, db.SupersedePendingReviewTaskForNewHeadParams{
@@ -1048,28 +1076,55 @@ func (s *TaskService) createAgentTask(ctx context.Context, params db.CreateAgent
 		HeadSha: params.HeadSha,
 	})
 	if err != nil {
-		return db.AgentTaskQueue{}, fmt.Errorf("supersede stale review task: %w", err)
+		return db.AgentTaskQueue{}, nil, fmt.Errorf("supersede stale review task: %w", err)
 	}
 	task, err := qtx.CreateAgentTask(ctx, params)
 	if err != nil {
 		if isDuplicatePendingTaskErr(err) {
-			return db.AgentTaskQueue{}, ErrReviewActivationBlocked
+			return db.AgentTaskQueue{}, nil, ErrReviewActivationBlocked
 		}
-		return db.AgentTaskQueue{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return db.AgentTaskQueue{}, fmt.Errorf("commit review task transaction: %w", err)
+		return db.AgentTaskQueue{}, nil, err
 	}
 
-	if len(cancelled) > 0 {
-		slog.Info("stale review task superseded after PR head advanced",
-			"issue_id", util.UUIDToString(params.IssueID),
-			"agent_id", util.UUIDToString(params.AgentID),
-			"head_sha", params.HeadSha.String,
-			"cancelled_count", len(cancelled))
-		s.BroadcastCancelledTasks(ctx, cancelled)
+	// Lock every currently-linked PR source before the final verification.
+	// A concurrent head writer that starts after these locks waits until this
+	// transaction commits; one that committed while the INSERT was in flight is
+	// observed by the READ COMMITTED re-read below and forces a full rollback.
+	if err := lockIssueReviewPullRequests(ctx, tx, params.IssueID); err != nil {
+		return db.AgentTaskQueue{}, nil, fmt.Errorf("lock review head sources: %w", err)
 	}
-	return task, nil
+	verifiedHead, verifyErr := qtx.GetIssueReviewHeadSha(ctx, params.IssueID)
+	if verifyErr != nil && !errors.Is(verifyErr, pgx.ErrNoRows) {
+		return db.AgentTaskQueue{}, nil, fmt.Errorf("verify transaction-current review head: %w", verifyErr)
+	}
+	if verifiedHead != currentHead {
+		return db.AgentTaskQueue{}, nil, errReviewHeadChangedDuringEnqueue
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return db.AgentTaskQueue{}, nil, fmt.Errorf("commit review task transaction: %w", err)
+	}
+	return task, cancelled, nil
+}
+
+func lockIssueReviewPullRequests(ctx context.Context, tx pgx.Tx, issueID pgtype.UUID) error {
+	for _, statement := range []string{
+		`SELECT id FROM issue WHERE id = $1 FOR UPDATE`,
+		`SELECT pr.id FROM github_pull_request pr JOIN issue_pull_request link ON link.pull_request_id = pr.id WHERE link.issue_id = $1 AND NOT link.reference_only FOR UPDATE OF link, pr`,
+		`SELECT pr.id FROM vcs_pull_request pr JOIN issue_vcs_pull_request link ON link.pull_request_id = pr.id WHERE link.issue_id = $1 AND NOT link.reference_only FOR UPDATE OF link, pr`,
+	} {
+		rows, err := tx.Query(ctx, statement, issueID)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+	}
+	return nil
 }
 
 func (s *TaskService) enqueueIssueTask(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID) (db.AgentTaskQueue, error) {

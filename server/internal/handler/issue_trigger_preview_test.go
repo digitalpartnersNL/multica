@@ -3,11 +3,29 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
+
+type blockingFailTxStarter struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingFailTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
+	close(b.entered)
+	select {
+	case <-b.release:
+		return nil, errors.New("injected transaction start failure")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 // seededReadyAgentID returns a workspace agent that has a runtime bound (the
 // fixture's first agent), so WillEnqueueRun treats it as ready.
@@ -287,10 +305,8 @@ func TestUpdateIssueSuppressRunSkipsEnqueue(t *testing.T) {
 	}
 }
 
-// A write that persisted its issue transition but failed to enqueue the run
-// must not answer 200. The response is explicitly retryable and the test pins
-// the actual persisted state so clients are never left guessing whether the
-// status mutation itself committed.
+// A failed activation compensates the status mutation so an identical retry
+// remains a real transition and can start exactly one run.
 func TestUpdateIssueRunEnqueueFailureIsVisible(t *testing.T) {
 	agentID := seededReadyAgentID(t)
 	issue := createIssueForTest(t, map[string]any{
@@ -319,11 +335,170 @@ func TestUpdateIssueRunEnqueueFailureIsVisible(t *testing.T) {
 	if err := testPool.QueryRow(context.Background(), `SELECT status FROM issue WHERE id = $1`, issue.ID).Scan(&storedStatus); err != nil {
 		t.Fatalf("read persisted issue status: %v", err)
 	}
-	if storedStatus != "todo" {
-		t.Fatalf("persisted issue status = %q, want todo", storedStatus)
+	if storedStatus != "backlog" {
+		t.Fatalf("persisted issue status = %q, want compensated backlog", storedStatus)
 	}
 	if got := taskCountFor(t, issue.ID, agentID); got != 0 {
 		t.Fatalf("failed enqueue created %d tasks, want 0", got)
+	}
+
+	testHandler.TaskService.TxStarter = originalTxStarter
+	retryW := httptest.NewRecorder()
+	retryReq := withURLParam(newRequest("PUT", "/api/issues/"+issue.ID, map[string]any{"status": "todo"}), "id", issue.ID)
+	testHandler.UpdateIssue(retryW, retryReq)
+	if retryW.Code != http.StatusOK {
+		t.Fatalf("UpdateIssue retry: got %d %s, want 200", retryW.Code, retryW.Body.String())
+	}
+	if got := taskCountFor(t, issue.ID, agentID); got != 1 {
+		t.Fatalf("retry task count = %d, want exactly 1", got)
+	}
+}
+
+func TestBatchUpdateIssueRunEnqueueFailureCompensatesAndRetries(t *testing.T) {
+	agentID := seededReadyAgentID(t)
+	issue := createIssueForTest(t, map[string]any{
+		"title":         "batch visible enqueue failure",
+		"status":        "backlog",
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	seedDupRacePR(t, issue.ID, 999423)
+
+	originalTxStarter := testHandler.TaskService.TxStarter
+	testHandler.TaskService.TxStarter = nil
+	t.Cleanup(func() { testHandler.TaskService.TxStarter = originalTxStarter })
+	body := map[string]any{"issue_ids": []string{issue.ID}, "updates": map[string]any{"status": "todo"}}
+	w := httptest.NewRecorder()
+	testHandler.BatchUpdateIssues(w, newRequest("POST", "/api/issues/batch?workspace_id="+testWorkspaceID, body))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("BatchUpdateIssues enqueue failure: got %d %s, want 503", w.Code, w.Body.String())
+	}
+	var storedStatus string
+	if err := testPool.QueryRow(context.Background(), `SELECT status FROM issue WHERE id = $1`, issue.ID).Scan(&storedStatus); err != nil {
+		t.Fatalf("read compensated batch status: %v", err)
+	}
+	if storedStatus != "backlog" {
+		t.Fatalf("batch persisted status = %q, want compensated backlog", storedStatus)
+	}
+	if got := taskCountFor(t, issue.ID, agentID); got != 0 {
+		t.Fatalf("failed batch enqueue created %d tasks, want 0", got)
+	}
+
+	testHandler.TaskService.TxStarter = originalTxStarter
+	retryW := httptest.NewRecorder()
+	testHandler.BatchUpdateIssues(retryW, newRequest("POST", "/api/issues/batch?workspace_id="+testWorkspaceID, body))
+	if retryW.Code != http.StatusOK {
+		t.Fatalf("BatchUpdateIssues retry: got %d %s, want 200", retryW.Code, retryW.Body.String())
+	}
+	if got := taskCountFor(t, issue.ID, agentID); got != 1 {
+		t.Fatalf("batch retry task count = %d, want exactly 1", got)
+	}
+}
+
+func TestUpdateIssueAssigneeEnqueueFailureCompensatesAndRetries(t *testing.T) {
+	agentID := seededReadyAgentID(t)
+	issue := createIssueForTest(t, map[string]any{
+		"title": "single assignment compensation", "status": "todo",
+		"assignee_type": "member", "assignee_id": testUserID,
+	})
+	seedDupRacePR(t, issue.ID, 999425)
+	original := testHandler.TaskService.TxStarter
+	testHandler.TaskService.TxStarter = nil
+	t.Cleanup(func() { testHandler.TaskService.TxStarter = original })
+	body := map[string]any{"assignee_type": "agent", "assignee_id": agentID}
+
+	w := httptest.NewRecorder()
+	testHandler.UpdateIssue(w, withURLParam(newRequest("PUT", "/api/issues/"+issue.ID, body), "id", issue.ID))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("assignment enqueue failure: got %d %s, want 503", w.Code, w.Body.String())
+	}
+	var assigneeType, assigneeID string
+	if err := testPool.QueryRow(context.Background(), `SELECT assignee_type, assignee_id FROM issue WHERE id=$1`, issue.ID).Scan(&assigneeType, &assigneeID); err != nil {
+		t.Fatalf("read compensated assignment: %v", err)
+	}
+	if assigneeType != "member" || assigneeID != testUserID {
+		t.Fatalf("compensated assignee = %s/%s, want member/%s", assigneeType, assigneeID, testUserID)
+	}
+
+	testHandler.TaskService.TxStarter = original
+	retry := httptest.NewRecorder()
+	testHandler.UpdateIssue(retry, withURLParam(newRequest("PUT", "/api/issues/"+issue.ID, body), "id", issue.ID))
+	if retry.Code != http.StatusOK || taskCountFor(t, issue.ID, agentID) != 1 {
+		t.Fatalf("assignment retry: status=%d tasks=%d, want 200/1", retry.Code, taskCountFor(t, issue.ID, agentID))
+	}
+}
+
+func TestBatchUpdateIssueAssigneeEnqueueFailureCompensatesAndRetries(t *testing.T) {
+	agentID := seededReadyAgentID(t)
+	issue := createIssueForTest(t, map[string]any{
+		"title": "batch assignment compensation", "status": "todo",
+		"assignee_type": "member", "assignee_id": testUserID,
+	})
+	seedDupRacePR(t, issue.ID, 999426)
+	original := testHandler.TaskService.TxStarter
+	testHandler.TaskService.TxStarter = nil
+	t.Cleanup(func() { testHandler.TaskService.TxStarter = original })
+	body := map[string]any{"issue_ids": []string{issue.ID}, "updates": map[string]any{"assignee_type": "agent", "assignee_id": agentID}}
+
+	w := httptest.NewRecorder()
+	testHandler.BatchUpdateIssues(w, newRequest("POST", "/api/issues/batch?workspace_id="+testWorkspaceID, body))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("batch assignment enqueue failure: got %d %s, want 503", w.Code, w.Body.String())
+	}
+	var assigneeType, assigneeID string
+	if err := testPool.QueryRow(context.Background(), `SELECT assignee_type, assignee_id FROM issue WHERE id=$1`, issue.ID).Scan(&assigneeType, &assigneeID); err != nil {
+		t.Fatalf("read compensated batch assignment: %v", err)
+	}
+	if assigneeType != "member" || assigneeID != testUserID {
+		t.Fatalf("compensated batch assignee = %s/%s, want member/%s", assigneeType, assigneeID, testUserID)
+	}
+
+	testHandler.TaskService.TxStarter = original
+	retry := httptest.NewRecorder()
+	testHandler.BatchUpdateIssues(retry, newRequest("POST", "/api/issues/batch?workspace_id="+testWorkspaceID, body))
+	if retry.Code != http.StatusOK || taskCountFor(t, issue.ID, agentID) != 1 {
+		t.Fatalf("batch assignment retry: status=%d tasks=%d, want 200/1", retry.Code, taskCountFor(t, issue.ID, agentID))
+	}
+}
+
+func TestUpdateIssueRunEnqueueFailureCompensationPreservesConcurrentStatusAndAssignee(t *testing.T) {
+	agentID := seededReadyAgentID(t)
+	issue := createIssueForTest(t, map[string]any{
+		"title":         "concurrent status survives compensation",
+		"status":        "backlog",
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	seedDupRacePR(t, issue.ID, 999424)
+
+	originalTxStarter := testHandler.TaskService.TxStarter
+	failpoint := &blockingFailTxStarter{entered: make(chan struct{}), release: make(chan struct{})}
+	testHandler.TaskService.TxStarter = failpoint
+	t.Cleanup(func() { testHandler.TaskService.TxStarter = originalTxStarter })
+
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req := withURLParam(newRequest("PUT", "/api/issues/"+issue.ID, map[string]any{"status": "todo"}), "id", issue.ID)
+		testHandler.UpdateIssue(w, req)
+	}()
+	<-failpoint.entered
+	if _, err := testPool.Exec(context.Background(), `UPDATE issue SET status = 'in_progress', assignee_type = 'member', assignee_id = $2, updated_at = now() + interval '1 second' WHERE id = $1`, issue.ID, testUserID); err != nil {
+		t.Fatalf("write concurrent status and assignee: %v", err)
+	}
+	close(failpoint.release)
+	<-done
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("UpdateIssue enqueue failure: got %d %s, want 503", w.Code, w.Body.String())
+	}
+	var storedStatus, storedAssigneeType, storedAssigneeID string
+	if err := testPool.QueryRow(context.Background(), `SELECT status, assignee_type, assignee_id FROM issue WHERE id = $1`, issue.ID).Scan(&storedStatus, &storedAssigneeType, &storedAssigneeID); err != nil {
+		t.Fatalf("read concurrent issue mutation: %v", err)
+	}
+	if storedStatus != "in_progress" || storedAssigneeType != "member" || storedAssigneeID != testUserID {
+		t.Fatalf("concurrent mutation = %q/%q/%q, want in_progress/member/%s", storedStatus, storedAssigneeType, storedAssigneeID, testUserID)
 	}
 }
 
@@ -371,7 +546,7 @@ func TestUpdateIssueStatusActivationConflictPreservesCommentTask(t *testing.T) {
 	`, taskID).Scan(&taskStatus, &storedHead, &storedTrigger); err != nil {
 		t.Fatalf("read preserved task: %v", err)
 	}
-	if storedStatus != "todo" || taskStatus != "queued" || storedHead != dupRaceHeadA || storedTrigger != commentID {
+	if storedStatus != "backlog" || taskStatus != "queued" || storedHead != dupRaceHeadA || storedTrigger != commentID {
 		t.Fatalf("persisted conflict state = issue:%q task:%q head:%q trigger:%q", storedStatus, taskStatus, storedHead, storedTrigger)
 	}
 	if got := taskCountFor(t, issue.ID, agentID); got != 1 {

@@ -344,6 +344,120 @@ func TestHeadShaDedup_EnqueueTransactionRefreshesAdvancedHead(t *testing.T) {
 	}
 }
 
+// A push can also commit after the enqueue transaction's first head read but
+// before its task insert. The deterministic trigger below pauses that insert
+// on an advisory lock without adding a production test hook. T2 advances B to
+// C and commits; only then may T1 continue. T1 must not commit a B-stamped task.
+func TestHeadShaDedup_ConcurrentPushBeforeCommitCannotPersistStaleHead(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool := newHeadShaDedupPool(t)
+	q := db.New(pool)
+	fx := createHeadShaDedupFixture(t, ctx, pool, shaB, "open")
+
+	const (
+		shaC    = "cccccccccccccccccccccccccccccccccccccccc"
+		lockKey = int64(873421)
+	)
+	triggerDDL := fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION test_block_head_sha_enqueue() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.issue_id::text = TG_ARGV[0] THEN
+				PERFORM pg_advisory_xact_lock(TG_ARGV[1]::bigint);
+			END IF;
+			RETURN NEW;
+		END $$;
+		DROP TRIGGER IF EXISTS test_block_head_sha_enqueue ON agent_task_queue;
+		CREATE TRIGGER test_block_head_sha_enqueue
+		BEFORE INSERT ON agent_task_queue
+		FOR EACH ROW EXECUTE FUNCTION test_block_head_sha_enqueue('%s', '%d')
+	`, util.UUIDToString(fx.issueID), lockKey)
+	if _, err := pool.Exec(ctx, triggerDDL); err != nil {
+		t.Fatalf("install enqueue pause trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS test_block_head_sha_enqueue ON agent_task_queue`)
+		pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS test_block_head_sha_enqueue()`)
+	})
+
+	lockTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin advisory lock holder: %v", err)
+	}
+	if _, err := lockTx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
+		lockTx.Rollback(ctx)
+		t.Fatalf("hold enqueue pause lock: %v", err)
+	}
+
+	type enqueueResult struct {
+		task db.AgentTaskQueue
+		err  error
+	}
+	resultCh := make(chan enqueueResult, 1)
+	svc := NewTaskService(q, pool, nil, events.New())
+	go func() {
+		task, err := svc.createAgentTask(ctx, db.CreateAgentTaskParams{
+			AgentID:   fx.agentID,
+			RuntimeID: fx.runtimeID,
+			IssueID:   fx.issueID,
+			Priority:  0,
+			HeadSha:   pgtype.Text{String: shaB, Valid: true},
+		}, true)
+		resultCh <- enqueueResult{task: task, err: err}
+	}()
+
+	// Wait until T1 is blocked inside the INSERT trigger. This makes the
+	// interleaving deterministic without sleeps.
+	for {
+		var waiting bool
+		if err := pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_locks
+				WHERE locktype = 'advisory'
+				  AND granted = FALSE
+				  AND objid = $1
+			)
+		`, lockKey).Scan(&waiting); err != nil {
+			lockTx.Rollback(ctx)
+			t.Fatalf("observe blocked enqueue: %v", err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case res := <-resultCh:
+			lockTx.Rollback(ctx)
+			t.Fatalf("enqueue completed before failpoint was observed: task=%v err=%v", res.task.ID, res.err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// T2 commits C while T1 is paused after reading B.
+	if _, err := pool.Exec(ctx, `
+		UPDATE github_pull_request SET head_sha = $1, pr_updated_at = now()
+		WHERE workspace_id = (SELECT workspace_id FROM issue WHERE id = $2)
+	`, shaC, util.UUIDToString(fx.issueID)); err != nil {
+		lockTx.Rollback(ctx)
+		t.Fatalf("T2 commit head C: %v", err)
+	}
+	if err := lockTx.Commit(ctx); err != nil {
+		t.Fatalf("release enqueue pause: %v", err)
+	}
+
+	res := <-resultCh
+	if res.err != nil {
+		t.Fatalf("T1 enqueue after concurrent push: %v", res.err)
+	}
+	var storedHead string
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(context->>'head_sha', '') FROM agent_task_queue WHERE id = $1`, util.UUIDToString(res.task.ID)).Scan(&storedHead); err != nil {
+		t.Fatalf("read T1 stored head: %v", err)
+	}
+	if storedHead != shaC {
+		t.Fatalf("T1 committed stale head %q after T2 committed %q", storedHead, shaC)
+	}
+}
+
 // A status activation must never clear a queued comment obligation merely to
 // make room for a newer-head review. With the existing one-pending-slot
 // contract the safe outcome is a retryable conflict: the comment task remains

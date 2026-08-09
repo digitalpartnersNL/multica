@@ -2978,6 +2978,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	); ok && !req.SuppressRun {
 		if err := h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.HandoffNote); err != nil {
 			slog.Error("issue updated but run enqueue failed", "issue_id", id, "error", err)
+			h.compensateFailedRunMutation(r.Context(), prevIssue, issue, actorType, actorID)
 			if errors.Is(err, service.ErrReviewActivationBlocked) {
 				writeError(w, http.StatusConflict, "issue updated; agent run is blocked by existing work, retry later")
 			} else {
@@ -3516,6 +3517,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		); ok && !req.Updates.SuppressRun {
 			if err := h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.Updates.HandoffNote); err != nil {
 				slog.Error("batch issue updated but run enqueue failed", "issue_id", issueID, "error", err)
+				h.compensateFailedRunMutation(r.Context(), prevIssue, issue, actorType, actorID)
 				runEnqueueFailures = append(runEnqueueFailures, issueID)
 			}
 		}
@@ -3555,6 +3557,39 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("batch update issues", append(logger.RequestAttrs(r), "count", updated)...)
 	writeJSON(w, http.StatusOK, map[string]any{"updated": updated})
+}
+
+// compensateFailedRunMutation restores the trigger-relevant mutation that
+// preceded a failed enqueue. The full compare-and-set makes concurrent edits
+// authoritative over this recovery path.
+func (h *Handler) compensateFailedRunMutation(ctx context.Context, previous, failed db.Issue, actorType, actorID string) {
+	restored, err := h.Queries.CompensateIssueStatusAfterRunEnqueueFailure(ctx, db.CompensateIssueStatusAfterRunEnqueueFailureParams{
+		RestoreStatus:       previous.Status,
+		RestoreAssigneeType: previous.AssigneeType,
+		RestoreAssigneeID:   previous.AssigneeID,
+		IssueID:             failed.ID,
+		WorkspaceID:         failed.WorkspaceID,
+		FailedStatus:        failed.Status,
+		FailedAssigneeType:  failed.AssigneeType,
+		FailedAssigneeID:    failed.AssigneeID,
+		FailedUpdatedAt:     failed.UpdatedAt,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		slog.Warn("run enqueue compensation skipped after concurrent issue update", "issue_id", uuidToString(failed.ID))
+		return
+	}
+	if err != nil {
+		slog.Error("run enqueue mutation compensation failed", "issue_id", uuidToString(failed.ID), "error", err)
+		return
+	}
+
+	prefix := h.getIssuePrefix(ctx, restored.WorkspaceID)
+	h.publish(protocol.EventIssueUpdated, uuidToString(restored.WorkspaceID), actorType, actorID, map[string]any{
+		"issue":            issueToResponse(restored, prefix),
+		"status_changed":   previous.Status != failed.Status,
+		"assignee_changed": previous.AssigneeType.String != failed.AssigneeType.String || uuidToString(previous.AssigneeID) != uuidToString(failed.AssigneeID),
+		"compensated":      true,
+	})
 }
 
 type BatchDeleteIssuesRequest struct {
