@@ -4870,6 +4870,21 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 		return nil, false
 	}
 	taskLog = taskLog.With("local_directory", assignment.AbsPath)
+	// Check the mode before the path: a mode this daemon can't honour is a
+	// version-skew problem the user fixes by upgrading, and reporting a path
+	// complaint first would send them looking in the wrong place.
+	if err := assignment.ValidateExecutionMode(); err != nil {
+		taskLog.Error("local_directory: unsupported execution mode", "error", err)
+		if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
+			kind:          terminalTaskReportFail,
+			taskID:        task.ID,
+			errorMessage:  err.Error(),
+			failureReason: "local_directory_error",
+		}); failErr != nil {
+			taskLog.Error("fail task after local_directory mode check", "error", failErr)
+		}
+		return nil, true
+	}
 	if err := validateLocalPath(assignment.AbsPath); err != nil {
 		taskLog.Error("local_directory: path validation failed", "error", err)
 		if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
@@ -5960,12 +5975,37 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 		if localAssignment.UsesWorktree() {
 			prepParams.LocalWorktree = &execenv.LocalWorktreeParams{LocalPath: localAssignment.AbsPath}
-		} else if localAssignment != nil {
-			prepParams.LocalWorkDir = localAssignment.AbsPath
-		}
-		env, err = d.prepareExecutionEnvironment(prepareCtx, prepParams)
-		if err != nil {
-			return TaskResult{}, fmt.Errorf("prepare execution environment: %w", err)
+			// Take the per-path mutex for the snapshot alone, then hand it
+			// straight back — long enough to read a consistent tree, short
+			// enough that worktree tasks still overlap for the run itself.
+			//
+			// A worktree task skips this lock for its execution, but the
+			// snapshot is the one moment it READS the user's directory, and the
+			// same real path can be attached to another project as an in_place
+			// resource (each project may attach it once, so several can).
+			// Snapshotting underneath a running in_place task would capture a
+			// half-written tree plus that task's in-flight sidecars.
+			release, lockErr := d.localPathLocks.Acquire(prepareCtx, localAssignment.RealPath, task.ID, func(holder string) {
+				taskLog.Info("local_directory: worktree snapshot waiting for in-place holder",
+					"holder", shortID(holder))
+			})
+			if lockErr != nil {
+				return TaskResult{}, fmt.Errorf("local_directory worktree: wait for a consistent snapshot of %s: %w",
+					localAssignment.AbsPath, lockErr)
+			}
+			env, err = d.prepareExecutionEnvironment(prepareCtx, prepParams)
+			release()
+			if err != nil {
+				return TaskResult{}, fmt.Errorf("prepare execution environment: %w", err)
+			}
+		} else {
+			if localAssignment != nil {
+				prepParams.LocalWorkDir = localAssignment.AbsPath
+			}
+			env, err = d.prepareExecutionEnvironment(prepareCtx, prepParams)
+			if err != nil {
+				return TaskResult{}, fmt.Errorf("prepare execution environment: %w", err)
+			}
 		}
 	}
 	// Belt-and-suspenders: also mark whatever root we ended up with, in case
@@ -5982,9 +6022,23 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// exactly when the user most wants to see how far the agent got.
 	if env.LocalWorktree != nil {
 		defer func() {
-			outcome := env.LocalWorktree.Finalize(taskLog)
+			outcome, finalizeErr := env.LocalWorktree.Finalize(taskLog)
 			if outcome.Branch != "" {
 				taskResult.BranchName = outcome.Branch
+			}
+			if finalizeErr == nil {
+				return
+			}
+			// The agent's changes could not be committed, so Finalize kept the
+			// worktree instead of deleting them. Fail the task: a "completed"
+			// task whose branch is missing the work reads as success, and the
+			// user would never learn the changes are sitting in an env root the
+			// GC reclaims on a timer. Only overwrite a nil error — an earlier
+			// failure is the more useful one to report.
+			taskLog.Error("local_directory: worktree finalize could not persist the agent's changes",
+				"error", finalizeErr, "preserved_path", outcome.PreservedPath)
+			if returnErr == nil {
+				returnErr = fmt.Errorf("local_directory worktree: %w", finalizeErr)
 			}
 		}()
 	}

@@ -55,13 +55,33 @@ type localDirectoryAssignment struct {
 // mutex entirely — that is the whole point of the mode — so every caller that
 // serialises, cleans up sidecars, or exempts the env root from GC must branch
 // on this rather than on "is there a local_directory assignment at all".
-//
-// An unknown mode string is treated as in_place: the server validates the enum
-// at write time, so a value we don't recognise means this daemon is older than
-// the resource. Falling back to the exclusive lock is the safe direction — it
-// costs concurrency, never correctness.
 func (a *localDirectoryAssignment) UsesWorktree() bool {
 	return a != nil && strings.TrimSpace(a.Ref.ExecutionMode) == localDirectoryModeWorktree
+}
+
+// ValidateExecutionMode rejects a mode this daemon does not implement.
+//
+// Falling back to in_place would be the wrong direction, even though it is the
+// older and more conservative code path. execution_mode is how a user asks for
+// ISOLATION, not merely for concurrency: silently running in_place instead
+// would let the agent edit the working copy the user explicitly asked it to
+// stay out of. Losing concurrency is a nuisance; ignoring a request to not
+// touch someone's files is a broken promise. So an unrecognised mode fails the
+// task with a message naming the version skew.
+func (a *localDirectoryAssignment) ValidateExecutionMode() error {
+	if a == nil {
+		return nil
+	}
+	switch strings.TrimSpace(a.Ref.ExecutionMode) {
+	case "", localDirectoryModeInPlace, localDirectoryModeWorktree:
+		return nil
+	default:
+		return fmt.Errorf(
+			"local_directory: this daemon does not support execution_mode %q for %q "+
+				"(update the daemon, or set the resource's execution mode to %q or %q); "+
+				"refusing to run in place, since that would modify a directory the resource asked to isolate",
+			a.Ref.ExecutionMode, a.AbsPath, localDirectoryModeInPlace, localDirectoryModeWorktree)
+	}
 }
 
 // localDirectoryAssignmentForTask returns the local_directory assignment a task

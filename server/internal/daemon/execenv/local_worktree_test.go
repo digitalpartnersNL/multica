@@ -20,6 +20,7 @@ func worktreeTestLogger() *slog.Logger {
 // global git setup.
 func newTestRepo(t *testing.T) string {
 	t.Helper()
+	requireGit(t)
 	dir := t.TempDir()
 	// macOS hands out /var/folders temp dirs that are symlinks to /private/var.
 	// resolveGitRoot canonicalises, so the test must compare against the
@@ -37,12 +38,24 @@ func newTestRepo(t *testing.T) string {
 	return dir
 }
 
+// requireGit skips the whole test when git is missing from the environment.
+// This is the ONLY place a skip is allowed: once a test is past it, every git
+// command is part of the assertion surface, so a failure there is a real
+// regression and must fail loudly. An earlier version skipped on any git error,
+// which would have turned "the delivered branch is gone" into a green run.
+func requireGit(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git is not available: %v", err)
+	}
+}
+
 func gitRun(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Skipf("git %v failed (git unavailable or misconfigured): %s: %v", args, out, err)
+		t.Fatalf("git %v failed: %s: %v", args, out, err)
 	}
 	return strings.TrimSpace(string(out))
 }
@@ -136,7 +149,7 @@ func TestFinalizeCommitsLeftoversAndKeepsBranch(t *testing.T) {
 
 	writeFile(t, filepath.Join(wt.Path, "agent-output.txt"), "work product\n")
 
-	outcome := wt.Finalize(worktreeTestLogger())
+	outcome := finalizeOK(t, wt)
 
 	if !outcome.AutoCommitted {
 		t.Error("AutoCommitted = false, want true")
@@ -167,7 +180,7 @@ func TestFinalizeDropsBranchWhenNothingChanged(t *testing.T) {
 	repo := newTestRepo(t)
 	wt := prepareForTest(t, repo)
 
-	outcome := wt.Finalize(worktreeTestLogger())
+	outcome := finalizeOK(t, wt)
 
 	if outcome.Branch != "" {
 		t.Errorf("Branch = %q, want empty for a no-op task", outcome.Branch)
@@ -198,7 +211,7 @@ func TestFinalizeDropsBranchWhenOnlyBaseWasDirty(t *testing.T) {
 		t.Errorf("worktree still dirty after baseline commit (dirty=%v, err=%v)", dirty, err)
 	}
 
-	outcome := wt.Finalize(worktreeTestLogger())
+	outcome := finalizeOK(t, wt)
 
 	if outcome.Branch != "" {
 		t.Errorf("Branch = %q, want empty: the agent changed nothing", outcome.Branch)
@@ -217,7 +230,7 @@ func TestFinalizeSeparatesUserBaselineFromAgentWork(t *testing.T) {
 	wt := prepareForTest(t, repo)
 
 	writeFile(t, filepath.Join(wt.Path, "agent-output.txt"), "work product\n")
-	outcome := wt.Finalize(worktreeTestLogger())
+	outcome := finalizeOK(t, wt)
 
 	if outcome.Branch == "" {
 		t.Fatal("no branch delivered for a task that changed a file")
@@ -345,7 +358,7 @@ func TestPrepareLocalWorktreeConcurrentTasks(t *testing.T) {
 		}
 	}
 	for _, wt := range results {
-		wt.Finalize(worktreeTestLogger())
+		finalizeOK(t, wt)
 	}
 	if list := gitRun(t, repo, "worktree", "list"); strings.Count(list, "\n") != 0 {
 		t.Errorf("worktrees left registered after finalize:\n%s", list)
@@ -402,7 +415,7 @@ func TestWorktreeModeDeliversBranchWithoutSidecars(t *testing.T) {
 	if err := CleanupSidecars(env.RootDir); err != nil {
 		t.Fatalf("CleanupSidecars: %v", err)
 	}
-	outcome := env.LocalWorktree.Finalize(worktreeTestLogger())
+	outcome := finalizeOK(t, env.LocalWorktree)
 
 	if outcome.Branch == "" {
 		t.Fatal("no branch delivered for a task that changed a file")
@@ -449,9 +462,170 @@ func TestPrepareLocalWorktreePrunesStaleRegistrations(t *testing.T) {
 	}
 
 	wt := prepareForTest(t, repo)
-	t.Cleanup(func() { wt.Finalize(worktreeTestLogger()) })
+	t.Cleanup(func() { finalizeOK(t, wt) })
 
 	if list := gitRun(t, repo, "worktree", "list"); strings.Contains(list, orphan.Path) {
 		t.Errorf("stale registration not pruned:\n%s", list)
+	}
+}
+
+// finalizeOK finalizes a worktree and fails the test if the work could not be
+// persisted. Tests that exercise the failure path call Finalize directly.
+func finalizeOK(t *testing.T, wt *LocalWorktree) LocalWorktreeOutcome {
+	t.Helper()
+	outcome, err := wt.Finalize(worktreeTestLogger())
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	return outcome
+}
+
+// The one operation in this flow that can destroy work is `git worktree remove
+// --force`. If the agent's changes could not be committed, removing the
+// worktree would delete the only copy — so Finalize must keep it and say so.
+// commit.gpgSign with no usable key is the realistic trigger: --no-verify does
+// not disable signing.
+func TestFinalizeKeepsWorktreeWhenCommitFails(t *testing.T) {
+	repo := newTestRepo(t)
+	wt := prepareForTest(t, repo)
+
+	writeFile(t, filepath.Join(wt.Path, "agent-output.txt"), "irreplaceable work\n")
+
+	// Force every commit in this worktree to fail the way a signing setup the
+	// daemon can't satisfy would.
+	gitRun(t, wt.Path, "config", "commit.gpgSign", "true")
+	gitRun(t, wt.Path, "config", "gpg.program", filepath.Join(repo, "definitely-not-a-real-gpg"))
+
+	outcome, err := wt.Finalize(worktreeTestLogger())
+
+	if err == nil {
+		t.Fatal("Finalize returned nil error after the commit failed")
+	}
+	if outcome.PreservedPath != wt.Path {
+		t.Errorf("PreservedPath = %q, want %q", outcome.PreservedPath, wt.Path)
+	}
+	// The whole point: the work is still on disk.
+	if got := readFile(t, filepath.Join(wt.Path, "agent-output.txt")); got != "irreplaceable work\n" {
+		t.Errorf("agent work was destroyed despite the commit failure, got %q", got)
+	}
+	// And it stays discoverable through git rather than only a log line.
+	if list := gitRun(t, repo, "worktree", "list"); !strings.Contains(list, wt.Path) {
+		t.Errorf("preserved worktree is no longer registered, so the user cannot find it:\n%s", list)
+	}
+	if !strings.Contains(err.Error(), wt.Path) {
+		t.Errorf("error should name the preserved path, got: %v", err)
+	}
+}
+
+// An in_place task on the same directory leaves .agent_context/ and .multica/
+// in the user's tree while it runs. A concurrent worktree snapshot sees them as
+// untracked files; copying them would hand this task another issue's brief and
+// commit it to the branch.
+func TestPrepareLocalWorktreeSkipsMulticaSidecars(t *testing.T) {
+	repo := newTestRepo(t)
+	writeFile(t, filepath.Join(repo, ".agent_context", "issue_context.md"), "OTHER issue's brief\n")
+	writeFile(t, filepath.Join(repo, ".multica", "project", "resources.json"), "{}\n")
+	writeFile(t, filepath.Join(repo, "real-untracked.txt"), "user's own file\n")
+
+	wt := prepareForTest(t, repo)
+	t.Cleanup(func() { finalizeOK(t, wt) })
+
+	if _, err := os.Stat(filepath.Join(wt.Path, ".agent_context")); !os.IsNotExist(err) {
+		t.Error("another task's .agent_context was copied into this worktree")
+	}
+	if _, err := os.Stat(filepath.Join(wt.Path, ".multica")); !os.IsNotExist(err) {
+		t.Error("another task's .multica was copied into this worktree")
+	}
+	if got := readFile(t, filepath.Join(wt.Path, "real-untracked.txt")); got != "user's own file\n" {
+		t.Errorf("the user's own untracked file was not replayed: %q", got)
+	}
+}
+
+// Silently starting from HEAD when the user's uncommitted state cannot be
+// replayed would have the agent review code the user never wrote and report on
+// it confidently. Refusing to start is the recoverable outcome.
+func TestPrepareLocalWorktreeFailsWhenUntrackedReplayIsTruncated(t *testing.T) {
+	repo := newTestRepo(t)
+	// One file over the copy budget is enough to prove the bound fails closed
+	// rather than under-copying; writing 2001 files would only be slower.
+	big := strings.Repeat("x", 1024)
+	for i := range maxUntrackedFiles + 1 {
+		writeFile(t, filepath.Join(repo, "untracked", "f"+string(rune('a'+i%26))+strings.Repeat("z", i/26)+".txt"), big)
+	}
+
+	_, err := PrepareLocalWorktree(LocalWorktreeParams{
+		LocalPath: repo,
+		EnvRoot:   t.TempDir(),
+		AgentName: "J",
+		TaskID:    "task-truncated",
+	}, worktreeTestLogger())
+
+	if err == nil {
+		t.Fatal("expected prepare to fail rather than replay a truncated tree")
+	}
+	if !strings.Contains(err.Error(), "in_place") {
+		t.Errorf("error should offer a way out, got: %v", err)
+	}
+	// A failed prepare must not leave a half-built worktree registered.
+	if list := gitRun(t, repo, "worktree", "list"); strings.Count(list, "\n") != 0 {
+		t.Errorf("aborted prepare left a worktree registered:\n%s", list)
+	}
+	if branches := gitRun(t, repo, "branch", "--list", "agent/*"); branches != "" {
+		t.Errorf("aborted prepare left a branch behind: %q", branches)
+	}
+}
+
+// Worktree tasks get a fresh env root per task ID, exactly like in_place ones
+// (shouldReusePriorWorkdir refuses any local assignment). So they need the same
+// per-issue Codex session store: without it, each comment turn on an issue
+// starts a new empty CODEX_HOME, the prior rollout is invisible, and the agent
+// silently loses the conversation it was having with the user.
+func TestPrepareWorktreeModeUsesPerIssueCodexSessionStore(t *testing.T) {
+	repo := newTestRepo(t)
+	workspacesRoot := t.TempDir()
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+
+	prepareTurn := func(taskID string) *Environment {
+		t.Helper()
+		env, err := Prepare(PrepareParams{
+			WorkspacesRoot: workspacesRoot,
+			WorkspaceID:    "ws-1",
+			TaskID:         taskID,
+			AgentName:      "J",
+			Provider:       "codex",
+			LocalWorktree:  &LocalWorktreeParams{LocalPath: repo},
+			Task:           TaskContextForEnv{IssueID: "issue-1", AgentID: "agent-1", AgentName: "J"},
+		}, worktreeTestLogger())
+		if err != nil {
+			t.Fatalf("Prepare(%s): %v", taskID, err)
+		}
+		t.Cleanup(func() { finalizeOK(t, env.LocalWorktree) })
+		return env
+	}
+
+	// Two turns on the same issue, different task IDs — the shape of a
+	// follow-up comment.
+	first := prepareTurn("aaaa1111-2222-3333-4444-555566667777")
+	second := prepareTurn("bbbb1111-2222-3333-4444-555566667777")
+
+	sessionsOf := func(env *Environment) string {
+		t.Helper()
+		target, err := filepath.EvalSymlinks(filepath.Join(env.CodexHome, "sessions"))
+		if err != nil {
+			t.Fatalf("resolve sessions dir: %v", err)
+		}
+		return target
+	}
+
+	firstSessions := sessionsOf(first)
+	secondSessions := sessionsOf(second)
+	if firstSessions != secondSessions {
+		t.Errorf("each turn got its own sessions dir, so Codex cannot resume:\n first  %s\n second %s",
+			firstSessions, secondSessions)
+	}
+	// And it must be the stable per-issue store, not a task-local directory.
+	if strings.Contains(firstSessions, shortID("aaaa1111-2222-3333-4444-555566667777")) {
+		t.Errorf("sessions dir is task-scoped (%s); it will not survive the next turn", firstSessions)
 	}
 }

@@ -117,6 +117,10 @@ type LocalWorktreeOutcome struct {
 	// AutoCommitted is true when the agent left uncommitted changes that
 	// Finalize committed so they would survive the worktree's removal.
 	AutoCommitted bool
+	// PreservedPath is set only when Finalize could NOT commit the agent's
+	// changes. The worktree at this path was intentionally left on disk because
+	// it is the only remaining copy of that work.
+	PreservedPath string
 }
 
 // PrepareLocalWorktree creates the task's worktree and replays the user's
@@ -196,14 +200,13 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 	// on a technicality.
 	stashSHA, stashErr := runGitTrimmed(gitRoot, append(commitIdentityArgs(gitRoot), "stash", "create")...)
 	if stashErr != nil {
-		// Don't fail the task over this: the worktree is still usable at HEAD,
-		// it just won't carry the user's uncommitted edits. Loud warning, and
-		// the caller reports the degraded state to the user.
-		if logger != nil {
-			logger.Warn("execenv: capture uncommitted changes failed; worktree will start from HEAD",
-				"git_root", gitRoot, "error", stashErr)
-		}
-		stashSHA = ""
+		// Fail closed. The promise of this mode is that the agent reasons about
+		// the code the user actually has; silently starting from HEAD instead
+		// would have it review a tree the user never saw and report confidently
+		// on it. A task that does not start is recoverable — one that answers
+		// from the wrong sources is not.
+		return nil, fmt.Errorf("execenv: could not capture the uncommitted changes in %q, "+
+			"so the worktree would not match what you have on disk: %w", gitRoot, stashErr)
 	}
 
 	branch := fmt.Sprintf("agent/%s/%s", sanitizeName(params.AgentName), shortID(params.TaskID))
@@ -223,34 +226,43 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 	// Replay tracked edits. Applied as unstaged modifications on top of HEAD so
 	// the branch history stays linear and the agent sees the same
 	// work-in-progress the user has open in their editor.
+	//
+	// Every failure below aborts the prepare and tears the worktree back down.
+	// A half-replayed tree is the worst outcome available: it looks like a
+	// working checkout, so nothing downstream questions it, while the agent
+	// silently reads different code than the user has.
 	if stashSHA != "" {
 		if out, applyErr := runGit(worktreePath, "stash", "apply", stashSHA); applyErr != nil {
-			// A conflict here would mean HEAD moved between the two commands.
-			// Leave the clean HEAD checkout in place rather than a half-applied
-			// tree, and let the user know what they're looking at.
-			if logger != nil {
-				logger.Warn("execenv: replay uncommitted changes into worktree failed; agent sees HEAD",
-					"git_root", gitRoot, "output", out, "error", applyErr)
-			}
-		} else {
-			wt.DirtyBaseCaptured = true
+			removeLocalWorktreeDir(gitRoot, worktreePath, logger)
+			deleteBranch(gitRoot, actualBranch, logger)
+			return nil, fmt.Errorf("execenv: could not replay the uncommitted changes from %q into the task worktree "+
+				"(the agent would have seen a different tree than you have): %s: %w",
+				gitRoot, strings.TrimSpace(out), applyErr)
 		}
+		wt.DirtyBaseCaptured = true
 	}
 
 	copied, skipped, err := copyUntrackedFiles(gitRoot, worktreePath, logger)
-	if err != nil && logger != nil {
-		logger.Warn("execenv: copy untracked files into worktree failed (non-fatal)",
-			"git_root", gitRoot, "error", err)
+	if err != nil {
+		removeLocalWorktreeDir(gitRoot, worktreePath, logger)
+		deleteBranch(gitRoot, actualBranch, logger)
+		return nil, fmt.Errorf("execenv: could not replay the untracked files from %q into the task worktree: %w", gitRoot, err)
+	}
+	if skipped > 0 {
+		// The bounds exist to stop a pathological repo from hanging the copy,
+		// but a truncated replay is still a tree the user would not recognise,
+		// so it fails rather than quietly under-copying. The message names the
+		// way out, because the usual cause is build output that should have
+		// been gitignored in the first place.
+		removeLocalWorktreeDir(gitRoot, worktreePath, logger)
+		deleteBranch(gitRoot, actualBranch, logger)
+		return nil, fmt.Errorf("execenv: %q has more untracked files than worktree mode replays "+
+			"(copied %d, %d left over; limits are %d files / %d MiB) — gitignore or clean up the untracked files, "+
+			"or switch the resource back to in_place",
+			gitRoot, copied, skipped, maxUntrackedFiles, maxUntrackedBytes>>20)
 	}
 	wt.UntrackedCopied = copied
 	wt.UntrackedSkipped = skipped
-	if skipped > 0 && logger != nil {
-		// Never let this pass as a clean prepare: the agent is about to reason
-		// about a tree that is missing files the user can see.
-		logger.Warn("execenv: some untracked files were not replayed into the worktree; the agent sees fewer files than the user has",
-			"git_root", gitRoot, "copied", copied, "skipped", skipped,
-			"max_files", maxUntrackedFiles, "max_bytes", maxUntrackedBytes)
-	}
 
 	// Commit the replayed state as a baseline so "did this task change
 	// anything?" has an exact answer later. Without it the user's own
@@ -259,10 +271,23 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 	// behind a branch the agent never touched. The baseline also makes the
 	// delivered branch readable — `git diff <baseline>..<branch>` is precisely
 	// the agent's work, with the user's WIP as its own labelled commit.
-	if dirty, dirtyErr := worktreeIsDirty(worktreePath); dirtyErr == nil && dirty {
-		if baseline, ok := commitBaseline(worktreePath, logger); ok {
-			wt.BaseCommit = baseline
+	dirty, dirtyErr := worktreeIsDirty(worktreePath)
+	if dirtyErr != nil {
+		removeLocalWorktreeDir(gitRoot, worktreePath, logger)
+		deleteBranch(gitRoot, actualBranch, logger)
+		return nil, fmt.Errorf("execenv: could not inspect the prepared worktree for %q: %w", gitRoot, dirtyErr)
+	}
+	if dirty {
+		baseline, baseErr := commitBaseline(worktreePath)
+		if baseErr != nil {
+			// Without a baseline the task cannot tell the user's work from the
+			// agent's, so it would later commit the user's files as if the agent
+			// had produced them. Refuse rather than deliver a misleading branch.
+			removeLocalWorktreeDir(gitRoot, worktreePath, logger)
+			deleteBranch(gitRoot, actualBranch, logger)
+			return nil, fmt.Errorf("execenv: could not record a baseline commit for the replayed state of %q: %w", gitRoot, baseErr)
 		}
+		wt.BaseCommit = baseline
 	}
 
 	// Note on keeping sidecars out of the delivered branch: we deliberately do
@@ -297,25 +322,46 @@ func PrepareLocalWorktree(params LocalWorktreeParams, logger *slog.Logger) (*Loc
 // remove --force` would happily delete uncommitted edits, and the user would
 // have no way to get them back. Committing first turns "the agent edited files"
 // into "the branch has a commit", which is the delivery contract for this mode.
-func (w *LocalWorktree) Finalize(logger *slog.Logger) LocalWorktreeOutcome {
+//
+// If that commit cannot be made — a repo with commit.gpgSign and no signing key
+// available to the daemon, a full disk, a ref lock we lost — Finalize returns an
+// error and DELIBERATELY LEAVES THE WORKTREE IN PLACE. Removing it would be the
+// one operation in this file that destroys work with no way back, and a warning
+// in the daemon log is not an acceptable substitute for the user's changes. The
+// surviving worktree stays registered in the user's repo, so `git worktree list`
+// points straight at it.
+func (w *LocalWorktree) Finalize(logger *slog.Logger) (LocalWorktreeOutcome, error) {
 	if w == nil {
-		return LocalWorktreeOutcome{}
+		return LocalWorktreeOutcome{}, nil
 	}
 	unlock := lockGitRoot(w.GitRoot)
 	defer unlock()
 
 	outcome := LocalWorktreeOutcome{Branch: w.Branch}
 
-	if dirty, err := worktreeIsDirty(w.Path); err != nil {
+	// Treat "can't tell" like "dirty": committing costs an empty commit at
+	// worst, while assuming clean risks deleting the agent's edits.
+	dirty, statusErr := worktreeIsDirty(w.Path)
+	if statusErr != nil {
 		if logger != nil {
 			logger.Warn("execenv: inspect worktree status failed; committing defensively",
-				"path", w.Path, "error", err)
+				"path", w.Path, "error", statusErr)
 		}
-		// Unknown state: try to commit anyway. A pointless empty commit is a
-		// far cheaper mistake than dropping the agent's edits.
-		outcome.AutoCommitted = w.commitAll(logger)
-	} else if dirty {
-		outcome.AutoCommitted = w.commitAll(logger)
+		dirty = true
+	}
+	if dirty {
+		committed, err := w.commitAll(logger)
+		if err != nil {
+			outcome.PreservedPath = w.Path
+			if logger != nil {
+				logger.Error("execenv: could not commit the agent's changes; keeping the worktree so the work is recoverable",
+					"path", w.Path, "branch", w.Branch, "git_root", w.GitRoot, "error", err)
+			}
+			return outcome, fmt.Errorf(
+				"could not commit the agent's changes to branch %s: %w; the work is preserved in the worktree at %s (listed by `git worktree list` in %s) — recover it before that directory is reclaimed",
+				w.Branch, err, w.Path, w.GitRoot)
+		}
+		outcome.AutoCommitted = committed
 	}
 
 	// A branch still sitting exactly on its base commit means the task changed
@@ -327,10 +373,7 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) LocalWorktreeOutcome {
 	removeLocalWorktreeDir(w.GitRoot, w.Path, logger)
 
 	if !producedWork {
-		if out, delErr := runGit(w.GitRoot, "branch", "-D", w.Branch); delErr != nil && logger != nil {
-			logger.Warn("execenv: delete empty task branch failed (non-fatal)",
-				"branch", w.Branch, "output", out, "error", delErr)
-		}
+		deleteBranch(w.GitRoot, w.Branch, logger)
 		outcome.Branch = ""
 	}
 
@@ -342,52 +385,49 @@ func (w *LocalWorktree) Finalize(logger *slog.Logger) LocalWorktreeOutcome {
 			"produced_work", producedWork,
 		)
 	}
-	return outcome
+	return outcome, nil
 }
 
 // commitBaseline records the user's replayed uncommitted state as the first
 // commit on the task branch, returning the new tip.
-func commitBaseline(worktreePath string, logger *slog.Logger) (string, bool) {
-	if !commitEverything(worktreePath, "chore(agent): baseline — uncommitted work from the local directory", logger) {
-		return "", false
+func commitBaseline(worktreePath string) (string, error) {
+	if _, err := commitEverything(worktreePath, "chore(agent): baseline — uncommitted work from the local directory"); err != nil {
+		return "", err
 	}
 	tip, err := runGitTrimmed(worktreePath, "rev-parse", "--verify", "HEAD")
 	if err != nil {
-		if logger != nil {
-			logger.Warn("execenv: resolve baseline commit failed", "path", worktreePath, "error", err)
-		}
-		return "", false
+		return "", fmt.Errorf("resolve baseline commit: %w", err)
 	}
-	return tip, true
+	return tip, nil
 }
 
 // commitAll stages and commits everything the agent left behind. Returns
-// whether a commit was actually created.
-func (w *LocalWorktree) commitAll(logger *slog.Logger) bool {
-	return commitEverything(w.Path, "chore(agent): uncommitted changes from task", logger)
+// whether a commit was actually created; an error means the changes are still
+// only on disk and the caller must not delete the worktree.
+func (w *LocalWorktree) commitAll(logger *slog.Logger) (bool, error) {
+	return commitEverything(w.Path, "chore(agent): uncommitted changes from task")
 }
 
-func commitEverything(worktreePath, message string, logger *slog.Logger) bool {
+// commitEverything returns (false, nil) for the benign "there was nothing to
+// commit" case and (false, err) for a real failure — the distinction callers
+// need to decide whether the tree is safe to discard.
+func commitEverything(worktreePath, message string) (bool, error) {
 	if out, err := runGit(worktreePath, "add", "-A"); err != nil {
-		if logger != nil {
-			logger.Warn("execenv: stage worktree changes failed", "path", worktreePath, "output", out, "error", err)
-		}
-		return false
+		return false, fmt.Errorf("git add: %s: %w", strings.TrimSpace(out), err)
 	}
 	// --no-verify: the user's commit hooks are written for the user's own
 	// workflow (interactive linters, test suites, signing prompts) and a hook
-	// failure here would mean losing the agent's work to save a lint run.
+	// failure here would mean losing the agent's work to save a lint run. Note
+	// it does NOT disable commit.gpgSign, which is why the caller has to treat
+	// a commit failure as "keep the worktree" rather than a warning.
 	args := append(commitIdentityArgs(worktreePath), "commit", "--no-verify", "-m", message)
 	if out, err := runGit(worktreePath, args...); err != nil {
 		if strings.Contains(out, "nothing to commit") {
-			return false
+			return false, nil
 		}
-		if logger != nil {
-			logger.Warn("execenv: commit worktree changes failed", "path", worktreePath, "output", out, "error", err)
-		}
-		return false
+		return false, fmt.Errorf("git commit: %s: %w", strings.TrimSpace(out), err)
 	}
-	return true
+	return true, nil
 }
 
 // commitIdentityArgs supplies a committer identity only when the repo doesn't
@@ -429,6 +469,19 @@ func removeLocalWorktreeDir(gitRoot, worktreePath string, logger *slog.Logger) {
 		if out, pruneErr := runGit(gitRoot, "worktree", "prune"); pruneErr != nil && logger != nil {
 			logger.Warn("execenv: git worktree prune failed", "output", out, "error", pruneErr)
 		}
+	}
+}
+
+// deleteBranch drops a task branch that carries nothing worth keeping — an
+// empty read-only run, or a prepare that aborted partway. Best-effort: a
+// leftover branch is untidy, never harmful.
+func deleteBranch(gitRoot, branch string, logger *slog.Logger) {
+	if branch == "" {
+		return
+	}
+	if out, err := runGit(gitRoot, "branch", "-D", branch); err != nil && logger != nil {
+		logger.Warn("execenv: delete task branch failed (non-fatal)",
+			"branch", branch, "output", out, "error", err)
 	}
 }
 
@@ -486,6 +539,14 @@ func copyUntrackedFiles(gitRoot, worktreePath string, logger *slog.Logger) (copi
 		if rel == "" {
 			continue
 		}
+		// Never replay Multica's own sidecars. They are untracked files in the
+		// user's directory whenever an in_place task is mid-flight on the same
+		// path, or was killed before its cleanup ran. Copying them would put
+		// another issue's brief inside this task's worktree — where the agent
+		// would read it as its own context — and commit it to the branch.
+		if isMulticaSidecarPath(rel) {
+			continue
+		}
 		if copied >= maxUntrackedFiles || budget <= 0 {
 			skipped++
 			continue
@@ -517,6 +578,29 @@ func copyUntrackedFiles(gitRoot, worktreePath string, logger *slog.Logger) (copi
 // copyUntrackedFile copies one untracked file into the worktree, creating
 // parent directories and preserving the executable bit — a script the user just
 // wrote and hasn't committed has to stay runnable for the agent.
+// multicaSidecarPrefixes are the paths Prepare writes into a workdir. A task
+// running in_place on the same directory leaves these present as untracked
+// files for the length of its run, so a concurrent worktree snapshot sees them.
+// CLAUDE.md / AGENTS.md are deliberately absent: those are ordinarily the
+// user's own tracked files, and the runtime only injects a marker block into
+// them, which CleanupRuntimeConfig removes.
+var multicaSidecarPrefixes = []string{
+	".agent_context",
+	".multica",
+}
+
+// isMulticaSidecarPath reports whether a repo-relative path is one of the
+// daemon's own sidecars rather than the user's content.
+func isMulticaSidecarPath(rel string) bool {
+	normalized := filepath.ToSlash(rel)
+	for _, prefix := range multicaSidecarPrefixes {
+		if normalized == prefix || strings.HasPrefix(normalized, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 func copyUntrackedFile(src, dst string, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err

@@ -69,13 +69,13 @@ Waiting does not modify the directory. A waiting task can be cancelled; otherwis
 
 Each task gets its own [git worktree](https://git-scm.com/docs/git-worktree) of your repo, created inside the runtime's own workspace directory. **Tasks on the same directory run concurrently — none of them wait**, and none of them write to your working copy.
 
-Requires the directory to be a git repository with at least one commit. If it is not, tasks fail with an explicit error rather than quietly falling back to serial execution.
+Requires the directory to be a git repository with at least one commit. If it is not, tasks fail with an explicit error rather than quietly falling back to serial execution. A runtime too old to implement the mode also fails the task rather than running in place — asking for `worktree` is asking for isolation, so silently editing your working copy instead is never the fallback.
 
 What the agent sees, and what you get back:
 
-- **The agent starts from what you see, not from `HEAD`.** Your uncommitted edits and your untracked files are replayed into the worktree, so the agent is not reviewing code you no longer have. Your own working copy, index, and stash list are never touched.
+- **The agent starts from what you see, not from `HEAD`.** Your uncommitted edits and your untracked files are replayed into the worktree, so the agent is not reviewing code you no longer have. Your own working copy, index, and stash list are never touched. If that state cannot be reproduced faithfully — including when there is more untracked content than the replay covers (2000 files / 200 MiB) — the task fails instead of starting from a tree you would not recognise. The usual fix is to gitignore or clean up build output that is not already ignored.
 - **The result is a branch in your repo**, named `agent/<agent>/<task>`. Find it with `git branch`, review it with `git log` / `git diff`, and merge or cherry-pick it yourself. Multica never merges it for you.
-- **Nothing is silently dropped.** Anything the agent leaves uncommitted is committed to that branch before the worktree is removed, including when the task fails partway.
+- **Nothing is silently dropped.** Anything the agent leaves uncommitted is committed to that branch before the worktree is removed, including when the task fails partway. In the rare case that commit itself cannot be made — for example a repo with `commit.gpgSign` and no signing key available to the runtime — the worktree is deliberately kept instead of removed, the task is reported as failed, and `git worktree list` in your repo points at the directory holding the work.
 - **A task that changes nothing leaves nothing behind.** Its branch is deleted rather than left as an empty entry in `git branch`.
 
 Because the worktree lives in the runtime's workspace directory, it is reclaimed on the normal cleanup schedule; only the branch persists in your repo.
