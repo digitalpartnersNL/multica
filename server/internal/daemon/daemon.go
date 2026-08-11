@@ -4799,7 +4799,15 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			// sibling workdir (which is the user's path) or the envRoot
 			// itself (we want output/ and logs/ to linger for forensic
 			// access).
-			if assignment, _ := localDirectoryAssignmentForTask(task, d.cfg.DaemonID); assignment != nil {
+			//
+			// Worktree mode is excluded: its workdir is a disposable
+			// worktree INSIDE envRoot, already removed by Finalize, and
+			// the deliverable lives on as a branch in the user's repo.
+			// Stamping it would hand every worktree task a permanently
+			// exempt env root, so the directory would accumulate one env
+			// root per task forever — the exact cost the exemption was
+			// meant to trade away for a user's own files.
+			if assignment, _ := localDirectoryAssignmentForTask(task, d.cfg.DaemonID); assignment != nil && !assignment.UsesWorktree() {
 				meta.LocalDirectory = true
 			}
 			if err := execenv.WriteGCMeta(result.EnvRoot, meta, taskLog); err != nil {
@@ -4873,6 +4881,17 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 			taskLog.Error("fail task after local_directory validation error", "error", failErr)
 		}
 		return nil, true
+	}
+
+	// Worktree mode is the whole point of not serialising: each task gets its
+	// own checkout of the repo inside its env root, so there is no shared
+	// mutable state on the user's path to protect. Skipping the mutex here is
+	// what lets sibling tasks on one directory run concurrently. Path
+	// validation above still applies — git needs to write worktree
+	// registrations into the user's repo.
+	if assignment.UsesWorktree() {
+		taskLog.Info("local_directory: worktree mode, skipping path mutex")
+		return nil, false
 	}
 
 	// While the lock is contended the daemon would otherwise sit blocked on
@@ -5939,7 +5958,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			CodexCustomArgs:       codexSandboxArgs,
 			Task:                  taskCtx,
 		}
-		if localAssignment != nil {
+		if localAssignment.UsesWorktree() {
+			prepParams.LocalWorktree = &execenv.LocalWorktreeParams{LocalPath: localAssignment.AbsPath}
+		} else if localAssignment != nil {
 			prepParams.LocalWorkDir = localAssignment.AbsPath
 		}
 		env, err = d.prepareExecutionEnvironment(prepareCtx, prepParams)
@@ -5952,6 +5973,20 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if env.RootDir != predictedRoot && env.RootDir != "" {
 		d.markActiveEnvRoot(env.RootDir)
 		defer d.unmarkActiveEnvRoot(env.RootDir)
+	}
+	// Finalize the worktree on EVERY exit path, success or failure: commit
+	// whatever the agent left uncommitted, then unregister the worktree from
+	// the user's repo. Deferred against the named return so a task that fails
+	// mid-run still hands back the branch holding its partial work instead of
+	// letting `git worktree remove --force` delete it. A failing task is
+	// exactly when the user most wants to see how far the agent got.
+	if env.LocalWorktree != nil {
+		defer func() {
+			outcome := env.LocalWorktree.Finalize(taskLog)
+			if outcome.Branch != "" {
+				taskResult.BranchName = outcome.Branch
+			}
+		}()
 	}
 	taskTempDir, err := ensureTaskTempDir(env.RootDir, task.WorkspaceID, task.ID)
 	if err != nil {
@@ -6010,7 +6045,20 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// up stale Multica instructions (issue id, trigger comment id, reply
 	// rules) and start acting on the previous task's context. Excise the
 	// marker block on the way out instead.
-	if env.LocalDirectory {
+	//
+	// Worktree mode runs the same pass for a different reason: the worktree is
+	// disposable, but its branch is the deliverable, and Finalize commits
+	// whatever is still on disk. Without this the sidecars would land in every
+	// task's diff. The .git/info/exclude trick repocache uses for github_repo
+	// worktrees is not available here — a linked worktree resolves info/exclude
+	// to the user's own common git dir, so using it would silently change what
+	// `git status` hides in the user's checkout. Removing the files we wrote is
+	// both narrower and exact; it also leaves a genuine agent edit to a tracked
+	// CLAUDE.md intact, since CleanupRuntimeConfig only excises our marker block.
+	//
+	// Ordering: this defer is registered after the Finalize defer above, so LIFO
+	// runs cleanup first and Finalize commits an already-clean worktree.
+	if env.LocalDirectory || env.LocalWorktree != nil {
 		defer func() {
 			if cerr := execenv.CleanupRuntimeConfig(env.WorkDir, provider); cerr != nil {
 				d.logger.Warn("execenv: cleanup runtime config failed (non-fatal)", "error", cerr)

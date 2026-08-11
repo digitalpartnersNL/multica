@@ -791,3 +791,86 @@ func TestAcquireLocalDirectoryLock_EarlyFailureReportsWithCancelledParent(t *tes
 		t.Fatalf("fail callback calls = %d, want %d", got, len(tests))
 	}
 }
+
+// Worktree mode exists to let sibling tasks on one directory run at the same
+// time, so the per-path mutex must not be taken at all. If it were, the mode
+// would look implemented while still serialising every task.
+func TestAcquireLocalDirectoryLockSkipsWorktreeMode(t *testing.T) {
+	t.Parallel()
+
+	const daemonID = "d-mine"
+	tmp := t.TempDir()
+	raw, err := json.Marshal(localDirectoryRef{
+		LocalPath:     tmp,
+		DaemonID:      daemonID,
+		ExecutionMode: localDirectoryModeWorktree,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	resources := []ProjectResourceData{
+		{ID: "r1", ResourceType: localDirectoryResourceType, ResourceRef: raw},
+	}
+
+	assignment, err := localDirectoryAssignmentForTask(Task{ID: "t1", ProjectResources: resources}, daemonID)
+	if err != nil {
+		t.Fatalf("assignment: %v", err)
+	}
+	if !assignment.UsesWorktree() {
+		t.Fatal("UsesWorktree() = false for execution_mode=worktree")
+	}
+
+	d := &Daemon{
+		cfg:            Config{DaemonID: daemonID},
+		localPathLocks: NewLocalPathLocker(),
+		logger:         slog.Default(),
+	}
+
+	// Two tasks on the same path must both proceed without a release callback
+	// and without either becoming the lock holder.
+	for _, taskID := range []string{"task-a", "task-b"} {
+		release, abort := d.acquireLocalDirectoryLockIfNeeded(
+			context.Background(),
+			Task{ID: taskID, ProjectResources: resources},
+			slog.Default(),
+		)
+		if abort {
+			t.Fatalf("%s: acquisition aborted", taskID)
+		}
+		if release != nil {
+			t.Fatalf("%s: got a release callback, so the path mutex was taken", taskID)
+		}
+	}
+	if got := d.localPathLocks.Holder(assignment.RealPath); got != "" {
+		t.Fatalf("holder = %q, want empty: worktree mode must not lock the path", got)
+	}
+}
+
+// The default and any unrecognised mode must keep the historical exclusive
+// lock. Failing open here would let a daemon older than the resource run two
+// tasks in one directory at once.
+func TestUsesWorktreeDefaultsToExclusive(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		mode string
+		want bool
+	}{
+		{"", false},
+		{localDirectoryModeInPlace, false},
+		{localDirectoryModeWorktree, true},
+		{" worktree ", true},
+		{"snapshot", false},
+		{"WORKTREE", false},
+	}
+	for _, tc := range cases {
+		a := &localDirectoryAssignment{Ref: localDirectoryRef{ExecutionMode: tc.mode}}
+		if got := a.UsesWorktree(); got != tc.want {
+			t.Errorf("UsesWorktree(%q) = %v, want %v", tc.mode, got, tc.want)
+		}
+	}
+	var nilAssignment *localDirectoryAssignment
+	if nilAssignment.UsesWorktree() {
+		t.Error("UsesWorktree() on nil assignment = true, want false")
+	}
+}

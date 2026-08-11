@@ -1102,3 +1102,60 @@ func TestCreateProjectBundledLocalDirectoryDaemonConflict(t *testing.T) {
 		t.Errorf("per-daemon bundle: expected 2 resources, got %d", len(resp.Resources))
 	}
 }
+
+// execution_mode selects between the historical exclusive in-place run and
+// worktree mode. It is validated at the API boundary because the daemon treats
+// an unknown value as in_place — without this check a typo would silently
+// downgrade a user who asked for concurrency back to a queue.
+func TestValidateLocalDirectoryRefExecutionMode(t *testing.T) {
+	accepted := []struct {
+		name string
+		mode string
+		want string
+	}{
+		{"absent means in_place", "", ""},
+		{"explicit in_place", "in_place", "in_place"},
+		{"worktree", "worktree", "worktree"},
+		{"surrounding whitespace is trimmed", "  worktree  ", "worktree"},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := map[string]any{"local_path": "/Users/foo/work", "daemon_id": "d1"}
+			if tc.mode != "" {
+				ref["execution_mode"] = tc.mode
+			}
+			raw, err := json.Marshal(ref)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			out, err := validateLocalDirectoryRef(raw)
+			if err != nil {
+				t.Fatalf("validateLocalDirectoryRef: %v", err)
+			}
+			var got localDirectoryRef
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatalf("unmarshal normalized ref: %v", err)
+			}
+			if got.ExecutionMode != tc.want {
+				t.Errorf("ExecutionMode = %q, want %q", got.ExecutionMode, tc.want)
+			}
+		})
+	}
+
+	rejected := []string{"snapshot", "WORKTREE", "in-place", "true"}
+	for _, mode := range rejected {
+		t.Run("rejects "+mode, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{
+				"local_path":     "/Users/foo/work",
+				"daemon_id":      "d1",
+				"execution_mode": mode,
+			})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if _, err := validateLocalDirectoryRef(raw); err == nil {
+				t.Errorf("execution_mode %q was accepted, want a validation error", mode)
+			}
+		})
+	}
+}

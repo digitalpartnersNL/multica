@@ -19,13 +19,23 @@ import (
 // constant — keep in sync if the type string is ever renamed.
 const localDirectoryResourceType = "local_directory"
 
+// Execution modes for local_directory resources. Mirrors the server-side
+// constants in handler/project_resource.go — keep in sync. An absent or empty
+// value means in_place, so resources created before worktree mode existed keep
+// their original behavior.
+const (
+	localDirectoryModeInPlace  = "in_place"
+	localDirectoryModeWorktree = "worktree"
+)
+
 // localDirectoryRef mirrors the server-side ref shape for local_directory
 // project resources. Defined locally so the daemon does not have to import
 // the server handler package.
 type localDirectoryRef struct {
-	LocalPath string `json:"local_path"`
-	DaemonID  string `json:"daemon_id"`
-	Label     string `json:"label,omitempty"`
+	LocalPath     string `json:"local_path"`
+	DaemonID      string `json:"daemon_id"`
+	Label         string `json:"label,omitempty"`
+	ExecutionMode string `json:"execution_mode,omitempty"`
 }
 
 // localDirectoryAssignment is the resolved view of a task's local_directory
@@ -38,6 +48,20 @@ type localDirectoryAssignment struct {
 	Ref      localDirectoryRef
 	AbsPath  string // user-provided path, cleaned but not symlink-resolved
 	RealPath string // canonical key for the path mutex
+}
+
+// UsesWorktree reports whether this assignment runs each task in its own git
+// worktree instead of in the user's directory. Worktree tasks skip the per-path
+// mutex entirely — that is the whole point of the mode — so every caller that
+// serialises, cleans up sidecars, or exempts the env root from GC must branch
+// on this rather than on "is there a local_directory assignment at all".
+//
+// An unknown mode string is treated as in_place: the server validates the enum
+// at write time, so a value we don't recognise means this daemon is older than
+// the resource. Falling back to the exclusive lock is the safe direction — it
+// costs concurrency, never correctness.
+func (a *localDirectoryAssignment) UsesWorktree() bool {
+	return a != nil && strings.TrimSpace(a.Ref.ExecutionMode) == localDirectoryModeWorktree
 }
 
 // localDirectoryAssignmentForTask returns the local_directory assignment a task

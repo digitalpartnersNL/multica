@@ -108,17 +108,37 @@ func validateGithubRepoRef(ref json.RawMessage) (json.RawMessage, error) {
 	return out, nil
 }
 
+// Execution modes for resource_type=local_directory. The zero value (absent
+// field) means in_place, so resources created before worktree mode existed keep
+// their original behavior without a data migration.
+const (
+	// localDirectoryModeInPlace runs the agent directly in the user's
+	// directory, serialised by the daemon's per-path mutex: one task at a
+	// time, edits land in the user's working tree.
+	localDirectoryModeInPlace = "in_place"
+	// localDirectoryModeWorktree runs each task in its own git worktree of
+	// the user's repo, created inside the daemon's env root. Tasks on the
+	// same directory run concurrently and deliver their work as a branch.
+	// Only valid when the directory is a git working tree — the daemon
+	// verifies that at task time, since the server can't see the filesystem.
+	localDirectoryModeWorktree = "worktree"
+)
+
 // localDirectoryRef is the JSONB shape stored for resource_type=local_directory.
-// It pins a project to an existing directory on a specific user machine, so
-// agent tasks run in-place rather than in an isolated git worktree. The
+// It pins a project to an existing directory on a specific user machine. The
 // daemon_id scopes the path to one daemon registration — the same string path
 // on a different machine is a different resource. The optional label is a
 // human-readable hint used by the UI; the row-level project_resource.label
 // column remains the generic column for any resource type.
+//
+// execution_mode selects how tasks share that directory: in_place (default)
+// keeps the historical one-task-at-a-time behavior, worktree gives each task an
+// isolated git worktree so tasks run concurrently.
 type localDirectoryRef struct {
-	LocalPath string `json:"local_path"`
-	DaemonID  string `json:"daemon_id"`
-	Label     string `json:"label,omitempty"`
+	LocalPath     string `json:"local_path"`
+	DaemonID      string `json:"daemon_id"`
+	Label         string `json:"label,omitempty"`
+	ExecutionMode string `json:"execution_mode,omitempty"`
 }
 
 func validateLocalDirectoryRef(ref json.RawMessage) (json.RawMessage, error) {
@@ -138,6 +158,13 @@ func validateLocalDirectoryRef(ref json.RawMessage) (json.RawMessage, error) {
 		return nil, errors.New("local_directory: daemon_id is required")
 	}
 	payload.Label = strings.TrimSpace(payload.Label)
+	payload.ExecutionMode = strings.TrimSpace(payload.ExecutionMode)
+	switch payload.ExecutionMode {
+	case "", localDirectoryModeInPlace, localDirectoryModeWorktree:
+	default:
+		return nil, fmt.Errorf("local_directory: execution_mode must be %q or %q, got %q",
+			localDirectoryModeInPlace, localDirectoryModeWorktree, payload.ExecutionMode)
+	}
 	out, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
