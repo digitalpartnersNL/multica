@@ -58,7 +58,11 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "127.0.0.1:${BACKEND_PORT:-${API_PORT:-${SERVER_PORT:-${PORT:-8080}}}}:8080"
+      # B1 (M1-plan DP-1007, besluitvoorstel akkoord 2026-08-12): backend op
+      # 0.0.0.0 zodat de M1-daemon over Tailscale kan verbinden
+      # (http://100.69.9.25:8111). Beveiliging = Tailscale-ACL die port 8111
+      # alleen voor M1 opent (zie _knowledge/tailscale-acl-multica-8111.md).
+      - "0.0.0.0:${BACKEND_PORT:-${API_PORT:-${SERVER_PORT:-${PORT:-8080}}}}:8080"
     volumes:
       - backend_uploads:/app/data/uploads
     environment:
