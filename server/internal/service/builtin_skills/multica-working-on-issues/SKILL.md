@@ -180,8 +180,12 @@ A status change is not cosmetic — the server enqueues or skips agent work base
 on it. These are the contracts, not advice:
 
 - **`backlog`** parks an agent-assigned issue: the assignee is set but no task
-  fires. Moving `backlog → todo` (or any non-done/non-cancelled status) enqueues
-  the assigned agent then.
+  fires. Moving it to any non-terminal active status enqueues the assigned
+  agent.
+- **`todo`** is the execution-entry status. Moving an assigned issue to `todo`
+  from any other status also requests a fresh run. This includes rejected work
+  moving from `in_review` back to `todo`. Pending-run deduplication and the
+  same-issue self-loop guard still apply.
 - **`in_progress` / `in_review` on assignment runs** are agent-managed CLI
   mutations, not `StartTask` / `CompleteTask` side effects. The assignment
   runtime brief asks ordinary agents for `todo`/`backlog` → `in_progress` then

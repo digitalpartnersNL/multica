@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -242,6 +243,273 @@ func TestHeadShaDedup_RepushInvalidatesDedup(t *testing.T) {
 	}
 	if hasPending(t, ctx, q, fx, shaB) {
 		t.Fatalf("dedup HIT for new HEAD B after repush — a fresh review would be suppressed")
+	}
+}
+
+// A dedup miss must also be insertable. The pending unique index is still
+// keyed on (issue_id, agent_id), so merely making the read-side dedup SHA-aware
+// is insufficient: without an atomic stale-task supersede, the B insert loses
+// to the queued A row and no review for B is created.
+func TestHeadShaDedup_RepushAtomicallySupersedesQueuedOldHead(t *testing.T) {
+	ctx := context.Background()
+	pool := newHeadShaDedupPool(t)
+	q := db.New(pool)
+	fx := createHeadShaDedupFixture(t, ctx, pool, shaA, "open")
+
+	enqueueReviewTask(t, ctx, q, fx, shaA)
+	if _, err := pool.Exec(ctx, `
+		UPDATE github_pull_request SET head_sha = $1, pr_updated_at = now()
+		WHERE workspace_id = (SELECT workspace_id FROM issue WHERE id = $2)
+	`, shaB, util.UUIDToString(fx.issueID)); err != nil {
+		t.Fatalf("advance PR head: %v", err)
+	}
+
+	svc := NewTaskService(q, pool, nil, events.New())
+	if _, err := svc.createAgentTask(ctx, db.CreateAgentTaskParams{
+		AgentID:   fx.agentID,
+		RuntimeID: fx.runtimeID,
+		IssueID:   fx.issueID,
+		Priority:  0,
+		HeadSha:   pgtype.Text{String: shaB, Valid: true},
+	}, true); err != nil {
+		t.Fatalf("enqueue review for advanced head B: %v", err)
+	}
+
+	rows, err := pool.Query(ctx, `
+		SELECT status, COALESCE(context->>'head_sha', '')
+		FROM agent_task_queue
+		WHERE issue_id = $1 AND agent_id = $2
+		ORDER BY created_at
+	`, util.UUIDToString(fx.issueID), util.UUIDToString(fx.agentID))
+	if err != nil {
+		t.Fatalf("list review tasks: %v", err)
+	}
+	defer rows.Close()
+
+	type taskState struct{ status, headSha string }
+	var got []taskState
+	for rows.Next() {
+		var state taskState
+		if err := rows.Scan(&state.status, &state.headSha); err != nil {
+			t.Fatalf("scan review task: %v", err)
+		}
+		got = append(got, state)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate review tasks: %v", err)
+	}
+	if len(got) != 2 || got[0] != (taskState{status: "cancelled", headSha: shaA}) || got[1] != (taskState{status: "queued", headSha: shaB}) {
+		t.Fatalf("review task lifecycle = %#v, want [cancelled/A queued/B]", got)
+	}
+}
+
+// The head passed by the caller is only a preflight snapshot. A push can land
+// before the enqueue transaction begins, so the transaction must re-read the
+// linked PR and stamp that authoritative head instead of persisting the stale
+// caller value.
+func TestHeadShaDedup_EnqueueTransactionRefreshesAdvancedHead(t *testing.T) {
+	ctx := context.Background()
+	pool := newHeadShaDedupPool(t)
+	q := db.New(pool)
+	fx := createHeadShaDedupFixture(t, ctx, pool, shaB, "open")
+
+	// The caller resolved B. Before its enqueue transaction starts, another
+	// request advances the linked PR to C.
+	const shaC = "cccccccccccccccccccccccccccccccccccccccc"
+	if _, err := pool.Exec(ctx, `
+		UPDATE github_pull_request SET head_sha = $1, pr_updated_at = now()
+		WHERE workspace_id = (SELECT workspace_id FROM issue WHERE id = $2)
+	`, shaC, util.UUIDToString(fx.issueID)); err != nil {
+		t.Fatalf("advance PR head B to C: %v", err)
+	}
+
+	svc := NewTaskService(q, pool, nil, events.New())
+	task, err := svc.createAgentTask(ctx, db.CreateAgentTaskParams{
+		AgentID:   fx.agentID,
+		RuntimeID: fx.runtimeID,
+		IssueID:   fx.issueID,
+		Priority:  0,
+		HeadSha:   pgtype.Text{String: shaB, Valid: true},
+	}, true)
+	if err != nil {
+		t.Fatalf("enqueue review after concurrent push: %v", err)
+	}
+
+	var storedHead string
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(context->>'head_sha', '') FROM agent_task_queue WHERE id = $1`, util.UUIDToString(task.ID)).Scan(&storedHead); err != nil {
+		t.Fatalf("read stored review head: %v", err)
+	}
+	if storedHead != shaC {
+		t.Fatalf("stored review head = %q, want transaction-current head %q", storedHead, shaC)
+	}
+}
+
+// A push can also commit after the enqueue transaction's first head read but
+// before its task insert. The deterministic trigger below pauses that insert
+// on an advisory lock without adding a production test hook. T2 advances B to
+// C and commits; only then may T1 continue. T1 must not commit a B-stamped task.
+func TestHeadShaDedup_ConcurrentPushBeforeCommitCannotPersistStaleHead(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool := newHeadShaDedupPool(t)
+	q := db.New(pool)
+	fx := createHeadShaDedupFixture(t, ctx, pool, shaB, "open")
+
+	const (
+		shaC    = "cccccccccccccccccccccccccccccccccccccccc"
+		lockKey = int64(873421)
+	)
+	triggerDDL := fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION test_block_head_sha_enqueue() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.issue_id::text = TG_ARGV[0] THEN
+				PERFORM pg_advisory_xact_lock(TG_ARGV[1]::bigint);
+			END IF;
+			RETURN NEW;
+		END $$;
+		DROP TRIGGER IF EXISTS test_block_head_sha_enqueue ON agent_task_queue;
+		CREATE TRIGGER test_block_head_sha_enqueue
+		BEFORE INSERT ON agent_task_queue
+		FOR EACH ROW EXECUTE FUNCTION test_block_head_sha_enqueue('%s', '%d')
+	`, util.UUIDToString(fx.issueID), lockKey)
+	if _, err := pool.Exec(ctx, triggerDDL); err != nil {
+		t.Fatalf("install enqueue pause trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS test_block_head_sha_enqueue ON agent_task_queue`)
+		pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS test_block_head_sha_enqueue()`)
+	})
+
+	lockTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin advisory lock holder: %v", err)
+	}
+	if _, err := lockTx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
+		lockTx.Rollback(ctx)
+		t.Fatalf("hold enqueue pause lock: %v", err)
+	}
+
+	type enqueueResult struct {
+		task db.AgentTaskQueue
+		err  error
+	}
+	resultCh := make(chan enqueueResult, 1)
+	svc := NewTaskService(q, pool, nil, events.New())
+	go func() {
+		task, err := svc.createAgentTask(ctx, db.CreateAgentTaskParams{
+			AgentID:   fx.agentID,
+			RuntimeID: fx.runtimeID,
+			IssueID:   fx.issueID,
+			Priority:  0,
+			HeadSha:   pgtype.Text{String: shaB, Valid: true},
+		}, true)
+		resultCh <- enqueueResult{task: task, err: err}
+	}()
+
+	// Wait until T1 is blocked inside the INSERT trigger. This makes the
+	// interleaving deterministic without sleeps.
+	for {
+		var waiting bool
+		if err := pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_locks
+				WHERE locktype = 'advisory'
+				  AND granted = FALSE
+				  AND objid = $1
+			)
+		`, lockKey).Scan(&waiting); err != nil {
+			lockTx.Rollback(ctx)
+			t.Fatalf("observe blocked enqueue: %v", err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case res := <-resultCh:
+			lockTx.Rollback(ctx)
+			t.Fatalf("enqueue completed before failpoint was observed: task=%v err=%v", res.task.ID, res.err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// T2 commits C while T1 is paused after reading B.
+	if _, err := pool.Exec(ctx, `
+		UPDATE github_pull_request SET head_sha = $1, pr_updated_at = now()
+		WHERE workspace_id = (SELECT workspace_id FROM issue WHERE id = $2)
+	`, shaC, util.UUIDToString(fx.issueID)); err != nil {
+		lockTx.Rollback(ctx)
+		t.Fatalf("T2 commit head C: %v", err)
+	}
+	if err := lockTx.Commit(ctx); err != nil {
+		t.Fatalf("release enqueue pause: %v", err)
+	}
+
+	res := <-resultCh
+	if res.err != nil {
+		t.Fatalf("T1 enqueue after concurrent push: %v", res.err)
+	}
+	var storedHead string
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(context->>'head_sha', '') FROM agent_task_queue WHERE id = $1`, util.UUIDToString(res.task.ID)).Scan(&storedHead); err != nil {
+		t.Fatalf("read T1 stored head: %v", err)
+	}
+	if storedHead != shaC {
+		t.Fatalf("T1 committed stale head %q after T2 committed %q", storedHead, shaC)
+	}
+}
+
+// A status activation must never clear a queued comment obligation merely to
+// make room for a newer-head review. With the existing one-pending-slot
+// contract the safe outcome is a retryable conflict: the comment task remains
+// byte-for-byte planned and no success-shaped replacement is created.
+func TestHeadShaDedup_StatusActivationPreservesOldHeadCommentTask(t *testing.T) {
+	ctx := context.Background()
+	pool := newHeadShaDedupPool(t)
+	q := db.New(pool)
+	fx := createHeadShaDedupFixture(t, ctx, pool, shaB, "open")
+
+	var commentID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content)
+		SELECT $1, workspace_id, 'agent', $2, 'review the prior head comment'
+		FROM issue WHERE id = $1
+		RETURNING id
+	`, util.UUIDToString(fx.issueID), util.UUIDToString(fx.agentID)).Scan(&commentID); err != nil {
+		t.Fatalf("create trigger comment: %v", err)
+	}
+	if _, err := q.CreateAgentTask(ctx, db.CreateAgentTaskParams{
+		AgentID:          fx.agentID,
+		RuntimeID:        fx.runtimeID,
+		IssueID:          fx.issueID,
+		Priority:         0,
+		TriggerCommentID: util.MustParseUUID(commentID),
+		HeadSha:          pgtype.Text{String: shaA, Valid: true},
+	}); err != nil {
+		t.Fatalf("create old-head comment task: %v", err)
+	}
+
+	svc := NewTaskService(q, pool, nil, events.New())
+	_, err := svc.createAgentTask(ctx, db.CreateAgentTaskParams{
+		AgentID:   fx.agentID,
+		RuntimeID: fx.runtimeID,
+		IssueID:   fx.issueID,
+		Priority:  0,
+		HeadSha:   pgtype.Text{String: shaB, Valid: true},
+	}, true)
+	if !errors.Is(err, ErrReviewActivationBlocked) {
+		t.Fatalf("status activation error = %v, want ErrReviewActivationBlocked", err)
+	}
+
+	var count int
+	var status, storedHead, storedTrigger string
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) OVER (), status, COALESCE(context->>'head_sha', ''), trigger_comment_id::text
+		FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2
+	`, util.UUIDToString(fx.issueID), util.UUIDToString(fx.agentID)).Scan(&count, &status, &storedHead, &storedTrigger); err != nil {
+		t.Fatalf("read preserved comment task: %v", err)
+	}
+	if count != 1 || status != "queued" || storedHead != shaA || storedTrigger != commentID {
+		t.Fatalf("preserved task = count=%d status=%q head=%q trigger=%q, want one queued A task with trigger %q", count, status, storedHead, storedTrigger, commentID)
 	}
 }
 

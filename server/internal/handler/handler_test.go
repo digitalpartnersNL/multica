@@ -3284,6 +3284,119 @@ func TestBacklogToTodoByAgentTriggersDifferentAssignee(t *testing.T) {
 	}
 }
 
+// TestInReviewToTodoReactivatesAssignee covers a rejected verification round:
+// moving an assigned issue back from in_review to todo must start a fresh run.
+// Requiring a manual rerun here leaves the board status and actual execution
+// state out of sync.
+func TestInReviewToTodoReactivatesAssignee(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	agentID := createHandlerTestAgent(t, "Review Rework Agent", nil)
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":         "Rejected verification requires rework",
+		"status":        "in_review",
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	testHandler.CreateIssue(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var created IssueResponse
+	json.NewDecoder(w.Body).Decode(&created)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, created.ID)
+		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, created.ID)
+	})
+
+	// Creation in an active status enqueues the initial execution. Complete it
+	// so the reactivation has no pending task to deduplicate against.
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET status = 'completed', completed_at = now()
+		WHERE issue_id = $1 AND agent_id = $2
+	`, created.ID, agentID); err != nil {
+		t.Fatalf("complete initial task: %v", err)
+	}
+
+	w = httptest.NewRecorder()
+	req = withURLParam(newRequest("PUT", "/api/issues/"+created.ID, map[string]any{
+		"status": "todo",
+	}), "id", created.ID)
+	testHandler.UpdateIssue(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("UpdateIssue: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var queued int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM agent_task_queue
+		WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'
+	`, created.ID, agentID).Scan(&queued); err != nil {
+		t.Fatalf("count rework tasks: %v", err)
+	}
+	if queued != 1 {
+		t.Fatalf("expected exactly 1 fresh task after in_review->todo, got %d", queued)
+	}
+}
+
+func TestInReviewToTodoByAgentSameIssueDoesNotSelfTrigger(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	agentID := createHandlerTestAgent(t, "Review Rework Self Agent", nil)
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":         "Self rejected verification",
+		"status":        "in_review",
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	testHandler.CreateIssue(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var created IssueResponse
+	json.NewDecoder(w.Body).Decode(&created)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, created.ID)
+		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, created.ID)
+	})
+
+	if _, err := testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, created.ID); err != nil {
+		t.Fatalf("remove initial task: %v", err)
+	}
+	selfTask := createHandlerTestTaskForAgentOnIssue(t, agentID, created.ID)
+
+	w = httptest.NewRecorder()
+	req = withURLParam(newRequest("PUT", "/api/issues/"+created.ID, map[string]any{
+		"status": "todo",
+	}), "id", created.ID)
+	req.Header.Set("X-Agent-ID", agentID)
+	req.Header.Set("X-Task-ID", selfTask)
+	testHandler.UpdateIssue(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("UpdateIssue: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var queued int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM agent_task_queue
+		WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'
+	`, created.ID, agentID).Scan(&queued); err != nil {
+		t.Fatalf("count self-trigger tasks: %v", err)
+	}
+	if queued != 0 {
+		t.Fatalf("expected no self-trigger after in_review->todo, got %d", queued)
+	}
+}
+
 // TestBacklogToTodoByAgentSameIssueDoesNotSelfTrigger verifies the
 // task-issue-scoped self-loop guard: an agent whose CURRENT task is
 // running on issue I and who flips I from backlog to an active status

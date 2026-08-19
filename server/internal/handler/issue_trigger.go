@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -17,13 +18,16 @@ import (
 const maxPreviewTriggerIssues = 500
 
 // issueTriggerWriteProbe builds the probe the write paths feed to
-// WillEnqueueRun. The private-agent gate is already enforced at the HTTP
-// boundary (validateAssigneePair on assign) and inside enqueueSquadLeaderTask
-// (canEnqueueSquadLeader), so a write must NOT re-run or sink it — it passes
-// allow-all. The self-loop check needs the request's X-Task-ID header.
-func (h *Handler) issueTriggerWriteProbe(r *http.Request, actorType string, issue db.Issue) service.IssueTriggerProbe {
+// WillEnqueueRun. A status-only write does not pass through
+// validateAssigneePair, so the probe must enforce the invocation gate itself.
+// This also keeps write and preview decisions identical for direct agents and
+// squad leaders.
+func (h *Handler) issueTriggerWriteProbe(r *http.Request, actorType, actorID, workspaceID string, issue db.Issue) service.IssueTriggerProbe {
+	originatorUserID := h.issueTriggerOriginator(r.Context(), actorType, actorID, issue)
 	return service.IssueTriggerProbe{
-		CanAccessAgent: nil, // allow-all; gate lives at the write boundary
+		CanAccessAgent: func(agent db.Agent) bool {
+			return h.canInvokeAgent(r.Context(), agent, actorType, actorID, originatorUserID, workspaceID)
+		},
 		IsSelfLoop: func() bool {
 			return h.isAgentRunningOnIssue(r, actorType, issue)
 		},
@@ -35,7 +39,7 @@ func (h *Handler) issueTriggerWriteProbe(r *http.Request, actorType string, issu
 // readiness to a member who cannot see it — matching validateAssigneePair /
 // canEnqueueSquadLeader) and the same self-loop guard.
 func (h *Handler) issueTriggerPreviewProbe(r *http.Request, actorType, actorID, workspaceID string, issue db.Issue) service.IssueTriggerProbe {
-	originatorUserID := h.invokeOriginatorFromRequest(r, actorType, actorID)
+	originatorUserID := h.issueTriggerOriginator(r.Context(), actorType, actorID, issue)
 	return service.IssueTriggerProbe{
 		CanAccessAgent: func(agent db.Agent) bool {
 			return h.canInvokeAgent(r.Context(), agent, actorType, actorID, originatorUserID, workspaceID)
@@ -46,20 +50,36 @@ func (h *Handler) issueTriggerPreviewProbe(r *http.Request, actorType, actorID, 
 	}
 }
 
+// issueTriggerOriginator returns the human identity the future queued task
+// will actually persist. Authorization must judge that same identity, rather
+// than the request task's originator, or preview/write can approve a squad run
+// that enqueueSquadLeaderTask subsequently rejects against issue provenance.
+func (h *Handler) issueTriggerOriginator(ctx context.Context, actorType, actorID string, issue db.Issue) string {
+	if actorType == "member" {
+		return actorID
+	}
+	return uuidToString(h.TaskService.OriginatorForIssueTask(ctx, issue, pgtype.UUID{}))
+}
+
 // dispatchIssueRun executes the enqueue side effect for a decision produced by
 // WillEnqueueRun, carrying an optional handoff note into the run's opening
 // context. The squad path still flows through enqueueSquadLeaderTask so the
 // leader access gate and pending dedup stay in one place.
-func (h *Handler) dispatchIssueRun(ctx context.Context, issue db.Issue, trigger service.IssueRunTrigger, actorType, actorID, handoffNote string) {
+func (h *Handler) dispatchIssueRun(ctx context.Context, issue db.Issue, trigger service.IssueRunTrigger, actorType, actorID, handoffNote string) error {
 	switch trigger.AssigneeType {
 	case "agent":
 		// The member who performed this assign/promote is the accountable human
 		// for the run (MUL-4302 §4). An agent actor is not a human, so only a
 		// member actor is threaded; otherwise attribution falls back to the chain.
-		_, _ = h.TaskService.EnqueueTaskForIssueWithHandoff(ctx, issue, handoffNote, memberActorUserID(actorType, actorID))
+		_, err := h.TaskService.EnqueueTaskForIssueWithHandoff(ctx, issue, handoffNote, memberActorUserID(actorType, actorID))
+		return err
 	case "squad":
-		h.enqueueSquadLeaderTask(ctx, issue, pgtype.UUID{}, actorType, actorID, handoffNote)
+		if !h.enqueueSquadLeaderTask(ctx, issue, pgtype.UUID{}, actorType, actorID, handoffNote) {
+			return fmt.Errorf("enqueue squad leader task failed")
+		}
+		return nil
 	}
+	return fmt.Errorf("unsupported issue run assignee type %q", trigger.AssigneeType)
 }
 
 // memberActorUserID returns the acting member's user id as a pgtype.UUID when the

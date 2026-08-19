@@ -121,6 +121,22 @@ UPDATE issue SET
 WHERE id = $1 AND workspace_id = $3
 RETURNING *;
 
+-- name: CompensateIssueStatusAfterRunEnqueueFailure :one
+-- Restore all trigger-relevant fields only when the row is still exactly the
+-- write that failed to start its promised run. Match only trigger-relevant
+-- fields so an unrelated concurrent edit (for example title) is preserved.
+UPDATE issue SET
+    status = @restore_status,
+    assignee_type = sqlc.narg('restore_assignee_type'),
+    assignee_id = sqlc.narg('restore_assignee_id'),
+    updated_at = now()
+WHERE id = @issue_id
+  AND workspace_id = @workspace_id
+  AND status = @failed_status
+  AND assignee_type IS NOT DISTINCT FROM sqlc.narg('failed_assignee_type')
+  AND assignee_id IS NOT DISTINCT FROM sqlc.narg('failed_assignee_id')
+RETURNING *;
+
 -- name: CreateIssueWithOrigin :one
 INSERT INTO issue (
     workspace_id, title, description, status, priority,

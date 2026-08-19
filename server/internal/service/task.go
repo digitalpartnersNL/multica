@@ -580,6 +580,17 @@ var ErrAttributionFailClosed = errors.New("attribution: no precise accountable h
 // upper-layer log or response can leak the constraint name (#5914, Elon review).
 var ErrDuplicatePendingTask = errors.New("a pending task for this issue and agent already exists")
 
+// ErrReviewActivationBlocked means an assignment/status activation resolved a
+// current PR head but could not occupy the pending slot because that slot is
+// held by a comment/coalesced/rerun task whose durable obligation must not be
+// cancelled. Callers must report a retryable conflict, never a success-shaped
+// response claiming that a new review run started.
+var ErrReviewActivationBlocked = errors.New("review activation is blocked by an existing durable task")
+
+var errReviewHeadChangedDuringEnqueue = errors.New("review head changed during enqueue")
+
+const maxReviewHeadEnqueueAttempts = 3
+
 // isDuplicatePendingTaskErr reports whether err is the unique-index violation on
 // idx_one_pending_task_per_issue_agent (a concurrent enqueue won the race).
 func isDuplicatePendingTaskErr(err error) bool {
@@ -1003,6 +1014,119 @@ func (s *TaskService) ResolveIssueReviewSHAParam(ctx context.Context, issueID pg
 	return headShaText(s.ResolveIssueReviewSHA(ctx, issueID))
 }
 
+// createAgentTask replaces a queued/dispatched review for an older PR head and
+// inserts the new-head task in one transaction. The existing pending unique
+// index remains the final race guard for concurrent same-head requests.
+func (s *TaskService) createAgentTask(ctx context.Context, params db.CreateAgentTaskParams, supersedeStaleReview bool) (db.AgentTaskQueue, error) {
+	// Superseding is intentionally limited to assignment/status activation.
+	// Comment enqueues and completion replays have a separate durable
+	// coalescing/hand-off contract: cancelling their blocker would fabricate a
+	// successful queue result and can discard planned-but-undelivered comments.
+	// Those paths always carry a trigger, a comment plan, or rerun lineage and
+	// must keep relying on duplicate detection plus reconciliation.
+	if !supersedeStaleReview {
+		return s.Queries.CreateAgentTask(ctx, params)
+	}
+	if s.TxStarter == nil {
+		return db.AgentTaskQueue{}, fmt.Errorf("create review task: transaction starter is unavailable")
+	}
+	for attempt := 1; attempt <= maxReviewHeadEnqueueAttempts; attempt++ {
+		task, cancelled, err := s.createReviewActivationAttempt(ctx, params)
+		if errors.Is(err, errReviewHeadChangedDuringEnqueue) {
+			slog.Info("review head changed during enqueue; retrying",
+				"issue_id", util.UUIDToString(params.IssueID),
+				"agent_id", util.UUIDToString(params.AgentID),
+				"attempt", attempt)
+			continue
+		}
+		if err != nil {
+			return db.AgentTaskQueue{}, err
+		}
+		if len(cancelled) > 0 {
+			slog.Info("stale review task superseded after PR head advanced",
+				"issue_id", util.UUIDToString(params.IssueID),
+				"agent_id", util.UUIDToString(params.AgentID),
+				"cancelled_count", len(cancelled))
+			s.BroadcastCancelledTasks(ctx, cancelled)
+		}
+		return task, nil
+	}
+	return db.AgentTaskQueue{}, fmt.Errorf("%w after %d attempts", errReviewHeadChangedDuringEnqueue, maxReviewHeadEnqueueAttempts)
+}
+
+func (s *TaskService) createReviewActivationAttempt(ctx context.Context, params db.CreateAgentTaskParams) (db.AgentTaskQueue, []db.AgentTaskQueue, error) {
+	tx, err := s.TxStarter.Begin(ctx)
+	if err != nil {
+		return db.AgentTaskQueue{}, nil, fmt.Errorf("begin review task transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	qtx := s.Queries.WithTx(tx)
+	// The caller's HeadSha is only a preflight snapshot. Re-read inside this
+	// transaction so a push that landed before Begin is the value stamped on
+	// both the supersede decision and the new review task.
+	currentHead, headErr := qtx.GetIssueReviewHeadSha(ctx, params.IssueID)
+	if headErr != nil && !errors.Is(headErr, pgx.ErrNoRows) {
+		return db.AgentTaskQueue{}, nil, fmt.Errorf("resolve transaction-current review head: %w", headErr)
+	}
+	params.HeadSha = headShaText(currentHead)
+	cancelled, err := qtx.SupersedePendingReviewTaskForNewHead(ctx, db.SupersedePendingReviewTaskForNewHeadParams{
+		IssueID: params.IssueID,
+		AgentID: params.AgentID,
+		HeadSha: params.HeadSha,
+	})
+	if err != nil {
+		return db.AgentTaskQueue{}, nil, fmt.Errorf("supersede stale review task: %w", err)
+	}
+	task, err := qtx.CreateAgentTask(ctx, params)
+	if err != nil {
+		if isDuplicatePendingTaskErr(err) {
+			return db.AgentTaskQueue{}, nil, ErrReviewActivationBlocked
+		}
+		return db.AgentTaskQueue{}, nil, err
+	}
+
+	// Lock every currently-linked PR source before the final verification.
+	// A concurrent head writer that starts after these locks waits until this
+	// transaction commits; one that committed while the INSERT was in flight is
+	// observed by the READ COMMITTED re-read below and forces a full rollback.
+	if err := lockIssueReviewPullRequests(ctx, tx, params.IssueID); err != nil {
+		return db.AgentTaskQueue{}, nil, fmt.Errorf("lock review head sources: %w", err)
+	}
+	verifiedHead, verifyErr := qtx.GetIssueReviewHeadSha(ctx, params.IssueID)
+	if verifyErr != nil && !errors.Is(verifyErr, pgx.ErrNoRows) {
+		return db.AgentTaskQueue{}, nil, fmt.Errorf("verify transaction-current review head: %w", verifyErr)
+	}
+	if verifiedHead != currentHead {
+		return db.AgentTaskQueue{}, nil, errReviewHeadChangedDuringEnqueue
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return db.AgentTaskQueue{}, nil, fmt.Errorf("commit review task transaction: %w", err)
+	}
+	return task, cancelled, nil
+}
+
+func lockIssueReviewPullRequests(ctx context.Context, tx pgx.Tx, issueID pgtype.UUID) error {
+	for _, statement := range []string{
+		`SELECT id FROM issue WHERE id = $1 FOR UPDATE`,
+		`SELECT pr.id FROM github_pull_request pr JOIN issue_pull_request link ON link.pull_request_id = pr.id WHERE link.issue_id = $1 AND NOT link.reference_only FOR UPDATE OF link, pr`,
+		`SELECT pr.id FROM vcs_pull_request pr JOIN issue_vcs_pull_request link ON link.pull_request_id = pr.id WHERE link.issue_id = $1 AND NOT link.reference_only FOR UPDATE OF link, pr`,
+	} {
+		rows, err := tx.Query(ctx, statement, issueID)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+	}
+	return nil
+}
+
 func (s *TaskService) enqueueIssueTask(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID) (db.AgentTaskQueue, error) {
 	return s.enqueueIssueTaskWithCommentPlan(ctx, issue, triggerCommentID, nil, forceFreshSession, handoffNote, actorUserID, rerunOfTaskID)
 }
@@ -1043,7 +1167,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
-	task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
+	task, err := s.createAgentTask(ctx, db.CreateAgentTaskParams{
 		AgentID:              issue.AssigneeID,
 		RuntimeID:            agent.RuntimeID,
 		IssueID:              issue.ID,
@@ -1066,7 +1190,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
-	})
+	}, !triggerCommentID.Valid && len(coalescedCommentIDs) == 0 && !rerunOfTaskID.Valid)
 	if err != nil {
 		slog.Error("task enqueue failed", "issue_id", util.UUIDToString(issue.ID), "error", err)
 		return db.AgentTaskQueue{}, fmt.Errorf("create task: %w", err)
@@ -1160,7 +1284,7 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
-	task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
+	task, err := s.createAgentTask(ctx, db.CreateAgentTaskParams{
 		AgentID:              agentID,
 		RuntimeID:            agent.RuntimeID,
 		IssueID:              issue.ID,
@@ -1185,7 +1309,7 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
-	})
+	}, isLeader && !triggerCommentID.Valid && len(coalescedCommentIDs) == 0 && !rerunOfTaskID.Valid)
 	if err != nil {
 		// A concurrent enqueue for the same (issue, agent) won the race and the
 		// unique index rejected this insert. That is benign — a sibling run
