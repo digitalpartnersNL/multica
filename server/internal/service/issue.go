@@ -140,6 +140,14 @@ var ErrProjectNotFound = errors.New("project not found in this workspace")
 // label set. Callers translate this into their transport's 400.
 var ErrIssueLabelNotFound = errors.New("issue label not found in this workspace")
 
+// ErrInProgressRequiresAssignee signals that an issue cannot be created in
+// the in_progress category without an assignee (I4127.DP). The HTTP handler
+// enforces the same invariant via validateInProgressRequiresAssignee; this
+// service gate is the defense-in-depth layer so future entry points that
+// call IssueService.Create directly (MCP, backfill, admin tooling) cannot
+// mint a zombie. Callers translate this into 400.
+var ErrInProgressRequiresAssignee = errors.New("issue cannot be in_progress without an assignee; assign the issue or move it to another status")
+
 // IssueCreateResult is the typed return from IssueService.Create.
 //
 //   - On the happy path: Issue is the new row, Attachments lists the
@@ -179,6 +187,17 @@ type IssueCreateResult struct {
 // Caller-owned validation is limited to transport-shaped checks: title
 // required, RFC3339 date format, assignee pair sanity.
 func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts IssueCreateOpts) (IssueCreateResult, error) {
+	// I4127.DP defense-in-depth: an issue born in the in_progress category
+	// must have an assignee. Without one no run is ever enqueued and the
+	// issue becomes a zombie (sits in_progress forever, counts against the
+	// queue ceiling). The HTTP handler enforces the same rule before it
+	// reaches this service; the service gate protects every other caller of
+	// Create (Lark, future MCP/backfill/admin) and stays fail-closed even if
+	// a transport layer is ever added without re-checking.
+	if p.Status == "in_progress" && (!p.AssigneeType.Valid || !p.AssigneeID.Valid) {
+		return IssueCreateResult{}, ErrInProgressRequiresAssignee
+	}
+
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
 		return IssueCreateResult{}, fmt.Errorf("begin tx: %w", err)

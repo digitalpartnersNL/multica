@@ -209,14 +209,14 @@ func createClaimReclaimAgentAndIssue(t *testing.T, ctx context.Context, runtimeI
 
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		INSERT INTO issue (workspace_id, title, status, priority, assignee_type, assignee_id, creator_id, creator_type, number, position)
 		VALUES (
-			$1, $2, 'in_progress', 'none', $3, 'member',
+			$1, $2, 'in_progress', 'none', 'agent', $3, $4, 'member',
 			(SELECT COALESCE(MAX(number), 82649) + 1 FROM issue WHERE workspace_id = $1),
 			0
 		)
 		RETURNING id
-	`, testWorkspaceID, name+" issue", testUserID).Scan(&issueID); err != nil {
+	`, testWorkspaceID, name+" issue", agentID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("setup: create issue: %v", err)
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
@@ -2842,10 +2842,10 @@ func TestCompleteTask_CommentTriggered_SynthesizesCommentWhenAgentSilent(t *test
 
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'mul-3310 agent output fixture', 'in_progress', 'none', $2, 'member', 3310, 0)
+		INSERT INTO issue (workspace_id, title, status, priority, assignee_type, assignee_id, creator_id, creator_type, number, position)
+		VALUES ($1, 'mul-3310 agent output fixture', 'in_progress', 'none', 'agent', $2, $3, 'member', 3310, 0)
 		RETURNING id
-	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+	`, testWorkspaceID, agentID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("setup: create issue: %v", err)
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
@@ -2948,10 +2948,10 @@ func TestCompleteTask_CommentTriggered_SkipsSynthesisWhenAgentAlreadyCommented(t
 
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'mul-1198 dedup fixture', 'in_progress', 'none', $2, 'member', 81199, 0)
+		INSERT INTO issue (workspace_id, title, status, priority, assignee_type, assignee_id, creator_id, creator_type, number, position)
+		VALUES ($1, 'mul-1198 dedup fixture', 'in_progress', 'none', 'agent', $2, $3, 'member', 81199, 0)
 		RETURNING id
-	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+	`, testWorkspaceID, agentID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("setup: create issue: %v", err)
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
@@ -3027,10 +3027,10 @@ func TestCompleteTask_CommentTriggered_SuppressesTrivialDoneOutput(t *testing.T)
 
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'trivial-done-suppression fixture', 'in_progress', 'none', $2, 'member', 81200, 0)
+		INSERT INTO issue (workspace_id, title, status, priority, assignee_type, assignee_id, creator_id, creator_type, number, position)
+		VALUES ($1, 'trivial-done-suppression fixture', 'in_progress', 'none', 'agent', $2, $3, 'member', 81200, 0)
 		RETURNING id
-	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+	`, testWorkspaceID, agentID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("setup: create issue: %v", err)
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
@@ -3098,10 +3098,10 @@ func TestCompleteTask_AssignmentTriggered_DoesNotSuppressTrivialDoneOutput(t *te
 
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'assignment-trivial-done fixture', 'in_progress', 'none', $2, 'member', 81201, 0)
+		INSERT INTO issue (workspace_id, title, status, priority, assignee_type, assignee_id, creator_id, creator_type, number, position)
+		VALUES ($1, 'assignment-trivial-done fixture', 'in_progress', 'none', 'agent', $2, $3, 'member', 81201, 0)
 		RETURNING id
-	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+	`, testWorkspaceID, agentID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("setup: create issue: %v", err)
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
@@ -3370,10 +3370,10 @@ func TestClaimTask_IssuePriorSessionRuntimeGuard(t *testing.T) {
 
 	var skipIssueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'runtime-session-skip fixture', 'in_progress', 'none', $2, 'member', 81203, 0)
+		INSERT INTO issue (workspace_id, title, status, priority, assignee_type, assignee_id, creator_id, creator_type, number, position)
+		VALUES ($1, 'runtime-session-skip fixture', 'in_progress', 'none', 'agent', $2, $3, 'member', 81203, 0)
 		RETURNING id
-	`, testWorkspaceID, testUserID).Scan(&skipIssueID); err != nil {
+	`, testWorkspaceID, agentID, testUserID).Scan(&skipIssueID); err != nil {
 		t.Fatalf("setup: create skip issue: %v", err)
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, skipIssueID) })
@@ -3418,10 +3418,10 @@ func TestClaimTask_IssuePriorSessionRuntimeGuard(t *testing.T) {
 
 	var resumeIssueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'runtime-session-resume fixture', 'in_progress', 'none', $2, 'member', 81204, 0)
+		INSERT INTO issue (workspace_id, title, status, priority, assignee_type, assignee_id, creator_id, creator_type, number, position)
+		VALUES ($1, 'runtime-session-resume fixture', 'in_progress', 'none', 'agent', $2, $3, 'member', 81204, 0)
 		RETURNING id
-	`, testWorkspaceID, testUserID).Scan(&resumeIssueID); err != nil {
+	`, testWorkspaceID, agentID, testUserID).Scan(&resumeIssueID); err != nil {
 		t.Fatalf("setup: create resume issue: %v", err)
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, resumeIssueID) })
@@ -3456,10 +3456,10 @@ func TestClaimTask_IssuePriorSessionRuntimeGuard(t *testing.T) {
 
 	var commentIssueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'comment-triggered-session-skip fixture', 'in_progress', 'none', $2, 'member', 81205, 0)
+		INSERT INTO issue (workspace_id, title, status, priority, assignee_type, assignee_id, creator_id, creator_type, number, position)
+		VALUES ($1, 'comment-triggered-session-skip fixture', 'in_progress', 'none', 'agent', $2, $3, 'member', 81205, 0)
 		RETURNING id
-	`, testWorkspaceID, testUserID).Scan(&commentIssueID); err != nil {
+	`, testWorkspaceID, agentID, testUserID).Scan(&commentIssueID); err != nil {
 		t.Fatalf("setup: create comment-triggered issue: %v", err)
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, commentIssueID) })
@@ -3511,10 +3511,10 @@ func TestClaimTask_IssuePriorSessionRuntimeGuard(t *testing.T) {
 
 	var freshIssueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'force-fresh-session fixture', 'in_progress', 'none', $2, 'member', 81206, 0)
+		INSERT INTO issue (workspace_id, title, status, priority, assignee_type, assignee_id, creator_id, creator_type, number, position)
+		VALUES ($1, 'force-fresh-session fixture', 'in_progress', 'none', 'agent', $2, $3, 'member', 81206, 0)
 		RETURNING id
-	`, testWorkspaceID, testUserID).Scan(&freshIssueID); err != nil {
+	`, testWorkspaceID, agentID, testUserID).Scan(&freshIssueID); err != nil {
 		t.Fatalf("setup: create force-fresh issue: %v", err)
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, freshIssueID) })
@@ -3576,10 +3576,10 @@ func TestClaimTask_ManualRetryReusesWorkdir(t *testing.T) {
 		issueNum++
 		var issueID string
 		if err := testPool.QueryRow(ctx, `
-			INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-			VALUES ($1, 'manual-retry-reuse fixture', 'in_progress', 'none', $2, 'member', $3, 0)
+			INSERT INTO issue (workspace_id, title, status, priority, assignee_type, assignee_id, creator_id, creator_type, number, position)
+			VALUES ($1, 'manual-retry-reuse fixture', 'in_progress', 'none', 'agent', $2, $3, 'member', $4, 0)
 			RETURNING id
-		`, testWorkspaceID, testUserID, issueNum).Scan(&issueID); err != nil {
+		`, testWorkspaceID, agentID, testUserID, issueNum).Scan(&issueID); err != nil {
 			t.Fatalf("setup: create issue: %v", err)
 		}
 		t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })

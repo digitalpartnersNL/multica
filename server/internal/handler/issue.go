@@ -2668,6 +2668,15 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "one or more labels not found in this workspace")
 		return
 	}
+	// Defense-in-depth (I4127.DP / DP-2027): IssueService.Create enforces
+	// the same in_progress-requires-assignee invariant as the handler-level
+	// gate. This mapping keeps the HTTP contract a clean 400 even if the
+	// handler-side check above is ever removed or a future caller path
+	// reaches the service without it.
+	if errors.Is(err, service.ErrInProgressRequiresAssignee) {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err != nil {
 		slog.Warn("create issue failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
 		writeError(w, http.StatusInternalServerError, "failed to create issue: "+err.Error())
