@@ -16,6 +16,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -145,8 +146,26 @@ func TestI4127_InProgressRequiresAssignee(t *testing.T) {
 
 		w := httptest.NewRecorder()
 		testHandler.BatchUpdateIssues(w, newRequest("PATCH", "/api/issues/batch", map[string]any{
-			"updates": []map[string]any{{"id": issueID, "status": "in_progress"}},
+			"issue_ids": []string{issueID},
+			"updates":   map[string]any{"status": "in_progress"},
 		}))
+
+		// I4191.DP: the request shape must be issue_ids + updates-object;
+		// the old array shape made the handler bail on "issue_ids is
+		// required" and the subtest passed without exercising the guard.
+		// Assert the response (200, updated:0) as well as the DB state.
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+		var resp struct {
+			Updated int `json:"updated"`
+		}
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if resp.Updated != 0 {
+			t.Fatalf("expected updated=0, got %d", resp.Updated)
+		}
 
 		var status string
 		if err := testPool.QueryRow(ctx, `SELECT status FROM issue WHERE id=$1`, issueID).Scan(&status); err != nil {
