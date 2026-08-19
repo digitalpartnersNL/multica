@@ -2469,6 +2469,14 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An issue created directly in the in_progress category must have an
+	// assignee: without one, no run is ever enqueued and the issue becomes a
+	// zombie (I4127.DP). See validateInProgressRequiresAssignee.
+	if status, msg := validateInProgressRequiresAssignee(status, assigneeType, assigneeID); status != 0 {
+		writeError(w, status, msg)
+		return
+	}
+
 	var parentIssueID pgtype.UUID
 	var projectID pgtype.UUID
 	if req.ProjectID != nil {
@@ -2887,6 +2895,21 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The write must not leave the issue in the in_progress category without
+	// an assignee (I4127.DP). Evaluate the RESULTING state: the status this
+	// request sets (if any) merged with the issue's current status, and the
+	// assignee pair merged the same way via params. This refuses both "move
+	// to in_progress while unassigned" and "unassign while in_progress", and
+	// also forces repair of legacy zombies on their next write.
+	resultingStatus := prevIssue.Status
+	if req.Status != nil {
+		resultingStatus = *req.Status
+	}
+	if status, msg := validateInProgressRequiresAssignee(resultingStatus, params.AssigneeType, params.AssigneeID); status != 0 {
+		writeError(w, status, msg)
+		return
+	}
+
 	attachmentIDs, ok := parseUUIDSliceOrBadRequest(w, req.AttachmentIDs, "attachment_ids")
 	if !ok {
 		return
@@ -3062,6 +3085,28 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 	default:
 		return http.StatusBadRequest, "assignee_type must be 'member', 'agent', or 'squad'"
 	}
+}
+
+// validateInProgressRequiresAssignee refuses writes that would leave an issue
+// in the in_progress category without an assignee (I4127.DP).
+//
+// An in_progress issue with no assignee is a zombie: the run enqueue path
+// only starts a run for a valid assignee, so the issue sits in_progress
+// forever with no run, no comments, and no owner — while still counting
+// against the queue ceiling. The status column has only an enum CHECK, so
+// nothing in the DB layer expresses the dependency; this is the
+// application-layer guard.
+func validateInProgressRequiresAssignee(statusKey string, assigneeType pgtype.Text, assigneeID pgtype.UUID) (int, string) {
+	if statusKey == "" {
+		return 0, ""
+	}
+	if statusKey != "in_progress" {
+		return 0, ""
+	}
+	if assigneeType.Valid && assigneeID.Valid {
+		return 0, ""
+	}
+	return http.StatusBadRequest, "issue cannot be in_progress without an assignee; assign the issue or move it to another status"
 }
 
 // shouldEnqueueAgentTask returns true when an issue creation or assignment
@@ -3433,6 +3478,16 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			if status, _ := h.validateAssigneePair(r.Context(), r, workspaceID, params.AssigneeType, params.AssigneeID); status != 0 {
 				continue
 			}
+		}
+
+		// I4127.DP: batch-update must not leave an issue in_progress without
+		// an assignee either.
+		batchResultingStatus := prevIssue.Status
+		if req.Updates.Status != nil {
+			batchResultingStatus = *req.Updates.Status
+		}
+		if status, _ := validateInProgressRequiresAssignee(batchResultingStatus, params.AssigneeType, params.AssigneeID); status != 0 {
+			continue
 		}
 
 		issue, err := h.Queries.UpdateIssue(r.Context(), params)
