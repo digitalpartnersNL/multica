@@ -222,6 +222,25 @@ func handlerTestRuntimeID(t *testing.T) string {
 	return runtimeID
 }
 
+// handlerTestAgentID returns the seeded workspace-visible "Handler Test
+// Agent" id. The agent is created in setupHandlerTestFixture; fixtures that
+// create issues in the in_progress category must pass it as a valid
+// agent-assignee, because the I4127 gate refuses in_progress writes without
+// an assignee.
+func handlerTestAgentID(t *testing.T) string {
+	t.Helper()
+
+	var agentID string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT id FROM agent WHERE workspace_id = $1 AND name = $2`,
+		testWorkspaceID, "Handler Test Agent",
+	).Scan(&agentID); err != nil {
+		t.Fatalf("failed to load handler test agent: %v", err)
+	}
+
+	return agentID
+}
+
 func createHandlerTestAgent(t *testing.T, name string, mcpConfig []byte) string {
 	t.Helper()
 
@@ -378,11 +397,14 @@ func TestIssueCRUD(t *testing.T) {
 		t.Fatalf("GetIssue: expected id '%s', got '%s'", issueID, fetched.ID)
 	}
 
-	// Update - partial (only status)
+	// Update - partial (only status + assignee for the I4127 gate)
 	w = httptest.NewRecorder()
 	status := "in_progress"
 	req = newRequest("PUT", "/api/issues/"+issueID, map[string]any{
 		"status": status,
+		// I4127.DP: moving to in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	req = withURLParam(req, "id", issueID)
 	testHandler.UpdateIssue(w, req)
@@ -929,6 +951,9 @@ func TestCreateIssueRejectsActiveDuplicate(t *testing.T) {
 		"status":          "in_progress",
 		"parent_issue_id": parentID,
 		"project_id":      projectID,
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {

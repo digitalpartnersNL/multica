@@ -392,6 +392,9 @@ func TestWebhook_MergedPR_AdvancesLinkedIssueToDone(t *testing.T) {
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "PR auto-merge test",
 		"status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -617,6 +620,9 @@ func TestWebhook_MergedPR_WaitsForOpenSibling(t *testing.T) {
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "Multi-PR auto-merge test",
 		"status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -793,6 +799,9 @@ func TestWebhook_ClosedSiblingAfterMerge(t *testing.T) {
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "Closed sibling after merge",
 		"status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -861,6 +870,9 @@ func TestWebhook_AllClosedWithoutMerge(t *testing.T) {
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "All closed no merge",
 		"status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -963,6 +975,9 @@ func TestWebhook_MergedPR_OnlyClosesIdentifiersWithClosingKeyword(t *testing.T) 
 		req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 			"title":  title,
 			"status": "in_progress",
+			// I4127.DP: in_progress requires a valid assignee.
+			"assignee_type": "agent",
+			"assignee_id":   handlerTestAgentID(t),
 		})
 		testHandler.CreateIssue(w, req)
 		if w.Code != http.StatusCreated {
@@ -1071,6 +1086,9 @@ func TestWebhook_MergedPR_TitlePrefixDoesNotClose(t *testing.T) {
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "title-prefix repro",
 		"status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -1132,6 +1150,9 @@ func TestWebhook_MergedPR_BranchNameDoesNotClose(t *testing.T) {
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "branch-name repro",
 		"status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -1253,6 +1274,9 @@ func TestWebhook_CloseKeywordRemovedBeforeMergeDoesNotClose(t *testing.T) {
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "close intent can be removed",
 		"status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -1302,6 +1326,9 @@ func TestWebhook_CloseKeywordRemovedBeforeMergeDoesNotClose(t *testing.T) {
 	req = newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "post merge close keyword is link only",
 		"status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -1362,6 +1389,9 @@ func TestWebhook_LinkOnlySiblingMergeAfterCloseKeywordPR(t *testing.T) {
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "needs two prs",
 		"status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -1442,6 +1472,9 @@ func TestWebhook_BareBodyMentionHiddenFromPRList(t *testing.T) {
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "mentioned in passing",
 		"status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -1514,6 +1547,9 @@ func TestWebhook_HiddenBodyMentionDoesNotBlockAutoAdvance(t *testing.T) {
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "closing PR plus invisible mention",
 		"status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -1663,6 +1699,9 @@ func setupPRTestIssue(t *testing.T, ctx context.Context, secret string) (IssueRe
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "PR CI test",
 		"status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -2094,11 +2133,13 @@ func TestWebhook_MergedPR_ChildWithParent_NotifiesParent(t *testing.T) {
 	secret := "merge-parent-notify-secret"
 	t.Setenv("GITHUB_WEBHOOK_SECRET", secret)
 
-	// Create parent (open) + child (in_progress) pair.
+	// Create parent (open, unassigned) + child pair. The parent is
+	// deliberately unassigned so the notification carries no routing
+	// mention (asserted below); the child moves to done via the webhook.
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "PR-merge parent " + time.Now().Format(time.RFC3339Nano),
-		"status": "in_progress",
+		"status": "todo",
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -2110,7 +2151,7 @@ func TestWebhook_MergedPR_ChildWithParent_NotifiesParent(t *testing.T) {
 	w = httptest.NewRecorder()
 	req = newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":           "PR-merge child " + time.Now().Format(time.RFC3339Nano),
-		"status":          "in_progress",
+		"status":          "todo",
 		"parent_issue_id": parent.ID,
 	})
 	testHandler.CreateIssue(w, req)
@@ -2821,6 +2862,9 @@ func TestWebhook_PullRequest_FansOutToBoundWorkspaces(t *testing.T) {
 	testHandler.CreateIssue(w, newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  "fan-out PR test",
 		"status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	}))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("CreateIssue: %d %s", w.Code, w.Body.String())

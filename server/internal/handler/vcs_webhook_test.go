@@ -78,6 +78,9 @@ func newVCSIssue(t *testing.T, title string) IssueResponse {
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title": title, "status": "in_progress",
+		// I4127.DP: in_progress requires a valid assignee.
+		"assignee_type": "agent",
+		"assignee_id":   handlerTestAgentID(t),
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {

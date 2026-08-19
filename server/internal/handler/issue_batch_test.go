@@ -98,7 +98,14 @@ func TestBatchUpdateValidUpdatesPersistAndCount(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/issues/batch-update", map[string]any{
 		"issue_ids": []string{a, b},
-		"updates":   map[string]any{"status": "in_progress"},
+		"updates": map[string]any{
+			"status": "in_progress",
+			// I4127.DP: moving to in_progress requires a valid assignee;
+			// the batch update must carry one or the gate silently skips
+			// both issues and updated stays 0.
+			"assignee_type": "agent",
+			"assignee_id":   handlerTestAgentID(t),
+		},
 	})
 	testHandler.BatchUpdateIssues(w, req)
 	if w.Code != http.StatusOK {
@@ -214,8 +221,12 @@ func newStagedBatchFixture(t *testing.T) stagedBatchFixture {
 
 	pw := httptest.NewRecorder()
 	preq := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		// I4127.DP: created open but UNASSIGNED — the assignee is set via
+		// direct SQL below so the child-done wake can enqueue the task we
+		// pin to the final comment without the create-time assignment
+		// trigger queueing an unrelated task at setup.
 		"title":  "batch-stage parent " + time.Now().Format(time.RFC3339Nano),
-		"status": "in_progress",
+		"status": "todo",
 	})
 	testHandler.CreateIssue(pw, preq)
 	if pw.Code != http.StatusCreated {
@@ -240,7 +251,7 @@ func newStagedBatchFixture(t *testing.T) stagedBatchFixture {
 		cw := httptest.NewRecorder()
 		creq := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 			"title":           "batch-stage child " + time.Now().Format(time.RFC3339Nano),
-			"status":          "in_progress",
+			"status":          "todo",
 			"parent_issue_id": parent.ID,
 		})
 		testHandler.CreateIssue(cw, creq)
