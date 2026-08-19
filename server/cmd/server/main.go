@@ -486,6 +486,15 @@ func main() {
 	if err := schedulerMgr.Register(scheduler.AutopilotScheduleDispatchJob(pool, queries, autopilotSvc)); err != nil {
 		slog.Warn("scheduler: failed to register autopilot_schedule_dispatch job", "error", err)
 	}
+	// DP-2027 / I4127.DP: zombie-reaper. The in_progress-requires-assignee
+	// invariant is enforced at the handler, service, and DB-CHECK layers;
+	// this periodic scan is the detection backstop for any row that slips
+	// through those (legacy pre-constraint rows, direct-SQL writers, a
+	// dropped constraint). It repairs zombies to todo and records what it
+	// touched on the audit row.
+	if err := schedulerMgr.Register(scheduler.ZombieReaperJob(pool)); err != nil {
+		slog.Warn("scheduler: failed to register zombie reaper job", "error", err)
+	}
 	go func() {
 		_ = schedulerMgr.Run(sweepCtx)
 	}()
