@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"sync"
@@ -68,7 +69,22 @@ func newServerHealth(pool *pgxpool.Pool) *serverHealth {
 	}
 }
 
-func (h *serverHealth) liveHandler(w http.ResponseWriter, _ *http.Request) {
+func (h *serverHealth) liveHandler(w http.ResponseWriter, r *http.Request) {
+	// Postgres is a hard dependency of this deployment: with the database
+	// unreachable, auth/login fails silently while the process itself stays
+	// up. /health must therefore not report green in that state — the stack
+	// would look operational while being functionally broken (I1610.DP /
+	// DP-2293). Reuse the cached readiness computation (same DB ping +
+	// migration gate as /healthz) but keep the classic liveness shape on
+	// success so existing consumers (docker healthchecks, daemon probes,
+	// monitoring) keep working.
+	resp, status := h.readiness(r.Context())
+	if status != http.StatusOK {
+		slog.Warn("health: database dependency down, reporting unhealthy (I1610.DP)",
+			"db", resp.Checks.DB, "migrations", resp.Checks.Migrations)
+		writeJSON(w, status, resp)
+		return
+	}
 	writeJSON(w, http.StatusOK, liveResponse{Status: "ok"})
 }
 

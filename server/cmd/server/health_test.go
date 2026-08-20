@@ -44,6 +44,67 @@ func (r stubRow) Scan(dest ...any) error {
 	return nil
 }
 
+func TestServerHealthLiveHandlerDBPingFailure(t *testing.T) {
+	// /health must not report green when postgres is unreachable (I1610.DP /
+	// DP-2293): a 200 here would make the stack look operational while
+	// auth/login silently fails.
+	db := &stubReadinessDB{pingErr: errors.New("db unavailable")}
+	h := &serverHealth{
+		db:                 db,
+		requiredMigrations: []string{"056_example"},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	h.liveHandler(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec.Code)
+	}
+
+	var resp readinessResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if resp.Status != "not_ready" {
+		t.Fatalf("status = %q, want %q", resp.Status, "not_ready")
+	}
+	if resp.Checks.DB != "error" {
+		t.Fatalf("db check = %q, want %q", resp.Checks.DB, "error")
+	}
+	if resp.Checks.Migrations != "unknown" {
+		t.Fatalf("migrations check = %q, want %q", resp.Checks.Migrations, "unknown")
+	}
+}
+
+func TestServerHealthLiveHandlerHealthy(t *testing.T) {
+	// Healthy stack keeps the classic liveness shape {"status":"ok"} so
+	// existing consumers (docker healthchecks, daemon probes, monitoring)
+	// keep working.
+	db := &stubReadinessDB{appliedCount: 1}
+	h := &serverHealth{
+		db:                 db,
+		requiredMigrations: []string{"056_example"},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	h.liveHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var resp liveResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Status != "ok" {
+		t.Fatalf("status = %q, want %q", resp.Status, "ok")
+	}
+}
+
 func TestServerHealthReadyHandlerDBPingFailure(t *testing.T) {
 	db := &stubReadinessDB{pingErr: errors.New("db unavailable")}
 	h := &serverHealth{
