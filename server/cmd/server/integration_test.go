@@ -21,6 +21,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/realtime"
+	"github.com/multica-ai/multica/server/internal/testutil"
 )
 
 var (
@@ -58,6 +59,17 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 
+	// Serialize concurrent runs of this suite on the shared test database,
+	// same class of contamination as the handler suite (I4187.DP): two runs
+	// share the fixed-slug fixture workspace "integration-tests" and each
+	// run's setup/teardown deletes the other's fixture mid-suite.
+	suiteLock, err := testutil.AcquireSuiteLock(ctx, pool, testutil.IntegrationSuiteLockKey)
+	if err != nil {
+		fmt.Printf("Failed to acquire integration suite lock: %v\n", err)
+		pool.Close()
+		os.Exit(1)
+	}
+
 	testPool = pool
 	testUserID, testWorkspaceID, err = setupIntegrationTestFixture(ctx, pool)
 	if err != nil {
@@ -91,6 +103,7 @@ func TestMain(m *testing.M) {
 			code = 1
 		}
 	}
+	suiteLock.Release(context.Background())
 	testServer.Close()
 	pool.Close()
 	os.Exit(code)

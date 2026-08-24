@@ -19,6 +19,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
+	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -53,6 +54,19 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 
+	// Serialize concurrent runs of this suite on the shared test database.
+	// Two `go test ./internal/handler/` runs (e.g. two agents at once) share
+	// one fixture workspace (slug "handler-tests"); each run's setup/teardown
+	// deletes workspace rows with that slug, so the second run deletes the
+	// first run's fixture mid-suite — hundreds of FK violations (I4187.DP).
+	// The advisory lock is session-scoped: it dies with this process.
+	suiteLock, err := testutil.AcquireSuiteLock(ctx, pool, testutil.HandlerSuiteLockKey)
+	if err != nil {
+		fmt.Printf("Failed to acquire handler suite lock: %v\n", err)
+		pool.Close()
+		os.Exit(1)
+	}
+
 	queries := db.New(pool)
 	hub := realtime.NewHub()
 	go hub.Run()
@@ -85,6 +99,7 @@ func TestMain(m *testing.M) {
 			code = 1
 		}
 	}
+	suiteLock.Release(context.Background())
 	pool.Close()
 	os.Exit(code)
 }
