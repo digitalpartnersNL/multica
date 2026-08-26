@@ -3925,6 +3925,19 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 // never started, so there is nothing to be idempotent about, and every bundle
 // that did download is already cached on disk — a retry resumes from there
 // instead of re-fetching the whole set (MUL-5370).
+//
+// queued_expired is retryable (I6570.DP / DP-5738): a task that sat in
+// 'queued' past the TTL without ever being claimed failed purely on
+// infrastructure — the queue was saturated or all its work happened behind a
+// long-running task — exactly the class this map exists for. Before this
+// entry, the sweeper's HandleFailedTasks → MaybeRetryFailedTask chain
+// declined the retry, the issue was silently reset to todo, and no follow-up
+// run ever fired (DB evidence 26 aug 2026: ~30 queued_expired rows, zero
+// retry children). The failure is trivially resume-safe: the agent process
+// never started, so the child inherits only queue metadata and cannot replay
+// a poisoned session. The default max_attempts budget (2 = first run + one
+// retry) still bounds the chain: a re-queued retry that again outlives the
+// TTL expires terminally instead of looping forever.
 var retryableReasons = map[string]bool{
 	"runtime_offline":           true,
 	"runtime_recovery":          true,
@@ -3932,6 +3945,7 @@ var retryableReasons = map[string]bool{
 	"codex_semantic_inactivity": true,
 	string(taskfailure.ReasonAgentProviderNetwork):   true,
 	string(taskfailure.ReasonSkillBundleUnavailable): true,
+	string(taskfailure.ReasonQueuedExpired):          true,
 }
 
 // Transient provider stream cuts (provider_network) get a bespoke three-tier
