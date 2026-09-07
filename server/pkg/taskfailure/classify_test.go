@@ -121,6 +121,13 @@ func TestClassifyRules(t *testing.T) {
 		{"selected model", "the selected model is no longer supported", ReasonAgentModelNotFoundOrUnavailable},
 		{"http 404", "HTTP 404: model endpoint not registered", ReasonAgentModelNotFoundOrUnavailable},
 		{"404 page not found", "404 page not found", ReasonAgentModelNotFoundOrUnavailable},
+		// I7771.DP / DP-6853: ZAI gateway rejects a provider-prefixed
+		// model string with 400 [1214][modelCode: does not exist].
+		{"zai modelcode does not exist", `API Error: 400 [1214][modelCode: does not exist][202609070802089a4713337e3e481f]; claude stderr: [claude-code:unrecognized_model] {"model":"zai:glm-5.3","query_source":"sdk"}`, ReasonAgentModelNotFoundOrUnavailable},
+		// The unrecognized_model stderr notice alone must NOT classify as
+		// a model error: claude-code emits it for every non-claude model
+		// string, including runs that complete successfully.
+		{"benign unrecognized_model notice stays unclaimed", `claude stderr: [claude-code:unrecognized_model] {"model":"glm-5.3","query_source":"sdk"}`, ReasonAgentUnknown},
 
 		// 9. Empty / unparseable output.
 		{"returned empty output", "openclaw returned empty output", ReasonAgentEmptyOrUnparseableOutput},
@@ -408,6 +415,38 @@ func TestNormalizeDaemonReason(t *testing.T) {
 			reason: string(ReasonAgentUnknown),
 			raw:    "API Error: the model is overloaded",
 			want:   ReasonAgentUnknown,
+		},
+
+		// --- I7771.DP / DP-6853: ZAI gateway 400 [1214][modelCode: does
+		// not exist]. An un-upgraded daemon classifies the provider-prefixed
+		// model reject as the catchall; the upgrade surfaces it as a config
+		// error instead of an unknown.
+		{
+			name:   "old daemon catchall on the zai model reject is upgraded",
+			reason: string(ReasonAgentUnknown),
+			raw:    `API Error: 400 [1214][modelCode: does not exist][202609070802089a4713337e3e481f]`,
+			want:   ReasonAgentModelNotFoundOrUnavailable,
+		},
+		{
+			name:   "pre-MUL-1949 coarse reason on the zai model reject is upgraded",
+			reason: "agent_error",
+			raw:    `API Error: 400 [1214][modelCode: does not exist][202609070802089a4713337e3e481f]`,
+			want:   ReasonAgentModelNotFoundOrUnavailable,
+		},
+		{
+			// A current daemon already classified it; nothing to do.
+			name:   "current daemon model reason passes through",
+			reason: string(ReasonAgentModelNotFoundOrUnavailable),
+			raw:    `API Error: 400 [1214][modelCode: does not exist][202609070802089a4713337e3e481f]`,
+			want:   ReasonAgentModelNotFoundOrUnavailable,
+		},
+		{
+			// A refined reason means the old daemon matched an earlier rule
+			// on this same text; it says more than the witness does.
+			name:   "refined reason with the model witness is left alone",
+			reason: string(ReasonAgentProcessFailure),
+			raw:    `claude exited with error: exit status 1: 400 [1214][modelCode: does not exist]`,
+			want:   ReasonAgentProcessFailure,
 		},
 	}
 

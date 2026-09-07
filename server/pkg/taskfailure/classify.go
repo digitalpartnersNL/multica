@@ -200,10 +200,26 @@ func Classify(rawError string) Reason {
 	//    we approximate with both substrings present, which captures
 	//    typical phrasings like "model X not found" and "the requested
 	//    model was not found".
+	//
+	//    "modelcode: does not exist" is ZAI's HTTP 400 body for an
+	//    unknown model id (error code 1214). A claude-runtime agent whose
+	//    model string carries a provider prefix — e.g. the hermes-style
+	//    "zai:glm-5.3" — reaches the gateway with the prefix intact and
+	//    is rejected there (I7771.DP / DP-6853). Before this witness the
+	//    failure landed in agent_error.unknown, which no resume blacklist
+	//    or dashboard surface distinguishes from genuine unknowns.
+	//
+	//    Deliberately NOT matched: the claude-code stderr notice
+	//    "[claude-code:unrecognized_model]" — that line is emitted for
+	//    EVERY non-claude model string, including runs that succeed, so
+	//    it is benign noise and classifying on it would mislabel healthy
+	//    configs (verified live 2026-09-07: --model glm-5.3 completes
+	//    with the same stderr notice).
 	case strings.Contains(lower, "model") && strings.Contains(lower, "not found"),
 		containsAny(lower,
 			"unknown model",
 			"selected model",
+			"modelcode: does not exist",
 			"http 404",
 			"404 page not found",
 		):
@@ -351,6 +367,15 @@ func NormalizeDaemonReason(reason, rawError string) Reason {
 	if legacyContextOverflowReasons[reason] &&
 		containsAny(strings.ToLower(rawError), contextWindowExceededWitnesses...) {
 		return ReasonAgentContextOverflow
+	}
+	// I7771.DP / DP-6853: same mixed-version gap for the ZAI model-reject
+	// 400. A daemon whose rule 8 predates the "modelcode: does not exist"
+	// witness reports agent_error.unknown; until every host updates, the
+	// server upgrades the label so dashboards and health monitors that
+	// alert on failure_reason see a config error instead of an unknown.
+	if (reason == string(ReasonAgentUnknown) || reason == "agent_error") &&
+		strings.Contains(strings.ToLower(rawError), "modelcode: does not exist") {
+		return ReasonAgentModelNotFoundOrUnavailable
 	}
 	return Reason(reason)
 }
