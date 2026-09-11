@@ -1,0 +1,41 @@
+# DP-1909 / HG-5 livegang override (12 sep 2026): backend op de lokaal
+# herbouwde image met de comment-plicht gate.
+#
+# Probleem (HG-5 / DP-1909, plan.0071 Fase D1, testplan G3a/G3b):
+# comment-plicht voor Multica-runs was uitsluitend prompt-geborgd
+# (workdir CLAUDE.md "## Output" + runtime workflow). Een run die geen
+# eindcomment post "slaagde" technisch gewoon — het resultaat bereikte
+# de gebruiker nooit. Type gat: shortfall (geen fail-closed check).
+#
+# Fix-commit: d662b9ee3 (feat(handler): comment-plicht gate), gebouwd
+# vanuit CLEAN worktree /Users/jurrie/multica-wt-dp1909 (base 1bfe753d2
+# = dp6853-image + 1 fix-commit). Bevat:
+#   1. Server-side gate in Handler.CompleteTask: een issue-run die
+#      /complete bereikt zonder substantive agent comment (type=comment,
+#      body >= 30 trimmed chars, sinds started_at) wordt gere-route naar
+#      het failure-path met failure_reason=missing_final_comment — zelfde
+#      patroon als de GH #6402 context-exhaustion normalisatie.
+#   2. Nieuwe platform-side failure reason missing_final_comment (23e
+#      canonieke waarde; taskfailure-taxonomie + tests bijgewerkt).
+#   3. Uitzonderingen (X5): COMMENT_PFLICHT_GATE=off killswitch
+#      (fail-closed default), issue-metadata comment_plicht_exempt=true,
+#      squad-leader no_action, chat/quick-create taken.
+#   4. Tests: G3a (geen comment -> failed), G3b (triviaal "OK" telt
+#      niet), positieve controle, X5-exemptie, chat-scope, killswitch.
+#
+# Blast radius (live DB, 14 d voor livegang): 17/3400 runs (0,5%) zou
+# de gate triggeren; alle 17 leunden op de synthesized fallback-comment.
+#
+# Gebruik:
+#   docker compose -f docker-compose.selfhost.yml -f docker-compose.dp1909.yml up -d backend
+# Rollback:
+#   docker compose -f docker-compose.selfhost.yml -f docker-compose.dp6853.yml up -d backend
+#
+# VERPLICHTE DEPLOY-VERIFICATIE (I4208.DP / DP-2667, DoD-stap, fail-closed):
+#   bash ~/development/_tools/deploy-verificatie.sh \
+#     --container multica-backend-1 --repo /Users/jurrie/multica \
+#     --fix-commit d662b9ee3 \
+#     --markers "comment-plicht gate" commentPlichtMinBodyChars missing_final_comment
+services:
+  backend:
+    image: multica-backend:dp1909-d662b9ee3
