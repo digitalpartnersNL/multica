@@ -92,6 +92,14 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	// HG-5 / DP-1909: the comment-plicht gate is armed in production but
+	// OFF for the shared handler fixture — most legacy tests complete runs
+	// without a final comment and assert that silent completion synthesizes
+	// / reconciles comments, which the gate intentionally re-routes to the
+	// failure path. daemon_comment_plicht_gate_test.go arms the gate
+	// explicitly (t.Setenv) for the tests that pin its behavior.
+	os.Setenv("COMMENT_PFLICHT_GATE", "off")
+
 	code := m.Run()
 	if err := cleanupHandlerTestFixture(context.Background(), pool); err != nil {
 		fmt.Printf("Failed to clean up handler test fixture: %v\n", err)

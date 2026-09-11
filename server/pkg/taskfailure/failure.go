@@ -12,20 +12,21 @@
 // This package lifts that classifier into the in-flight write path so the
 // stored failure_reason is already refined when the row is first
 // persisted, and so server / daemon / cloud share a single source of
-// truth for the canonical 22 values. PR1 of the Grafana board plan
+// truth for the canonical values. PR1 of the Grafana board plan
 // ([MUL-2946](https://multica/issues/MUL-2946)). Subsequent PRs use
 // AllReasons() to pre-warm the Prometheus failure_reason label set.
 //
-// The 22 canonical values fall into two groups:
+// The canonical values fall into two groups:
 //
-//   - 8 platform-side values (no `agent_error.` prefix) emitted by the
-//     server-side sweepers and daemon classifiers when the failure is
-//     attributable to the platform/scheduler/runtime layer rather than
-//     anything the agent process did:
+//   - 9 platform-side values (no `agent_error.` prefix) emitted by the
+//     server-side sweepers, boundary normalizations, and daemon
+//     classifiers when the failure is attributable to the
+//     platform/scheduler/runtime layer rather than anything the agent
+//     process did:
 //
 //     queued_expired, runtime_offline, runtime_recovery, timeout,
 //     iteration_limit, agent_blocked, api_invalid_request,
-//     skill_bundle_unavailable
+//     skill_bundle_unavailable, missing_final_comment
 //
 //   - 14 agent-side values (with `agent_error.` prefix) produced by
 //     Classify(rawError) when the agent process surfaced an error string.
@@ -110,6 +111,19 @@ const (
 	// converge instead of re-downloading the whole set. Written by
 	// taskRunFailureReason in daemon/daemon.go.
 	ReasonSkillBundleUnavailable Reason = "skill_bundle_unavailable"
+
+	// ReasonMissingFinalComment: an issue run completed without the agent
+	// posting a substantive final comment on its issue — the run "succeeds"
+	// while its result never reaches the reader (HG-5 / DP-1909, plan.0071
+	// D1). Platform-side: this is the comment-plicht hard rule enforced at
+	// the /complete boundary, re-routing the completion to the failure path
+	// the same way CompleteTask's context-exhaustion normalization does
+	// (GH #6402). A substantive comment is a type='comment' row of at least
+	// 30 trimmed characters authored by the task's agent on the task's
+	// issue at/after the run's started_at; system/status/progress rows and
+	// trivial bodies ("OK", "done") do not count. Not retryable — the work
+	// happened but was not reported; a rerun is a human/agent decision.
+	ReasonMissingFinalComment Reason = "missing_final_comment"
 
 	// Agent process side: failure surfaced by the agent CLI / SDK as
 	// an error string. Classify(rawError) is responsible for picking
@@ -205,6 +219,7 @@ var allReasons = []Reason{
 	ReasonAgentBlocked,
 	ReasonAPIInvalidRequest,
 	ReasonSkillBundleUnavailable,
+	ReasonMissingFinalComment,
 
 	// Agent process side: provider errors.
 	ReasonAgentProviderAuthOrAccess,

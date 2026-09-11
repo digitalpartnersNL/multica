@@ -452,6 +452,28 @@ SELECT EXISTS (
       AND created_at >= @since
 ) AS commented;
 
+-- name: HasSubstantiveAgentCommentSince :one
+-- HG-5 / DP-1909 (plan.0071 D1): reports whether the agent posted a
+-- SUBSTANTIVE comment row on the issue at/after the run's started_at.
+-- Substantive = type 'comment' (not system / status_change /
+-- progress_update) with a trimmed body of at least @min_body_chars.
+-- CLI comments posted through /issues/{id}/comments carry
+-- source_task_id = the running task's id, so a same-task comment is the
+-- strongest form of evidence; comments the platform itself synthesizes
+-- at completion time (fallback from final output) land AFTER
+-- completed_at and are stamped with this task's id too, which is why
+-- the gate must run BEFORE the completion transaction flips the status
+-- and before CompleteTask synthesizes anything.
+SELECT EXISTS (
+    SELECT 1 FROM comment
+    WHERE issue_id = @issue_id
+      AND author_type = 'agent'
+      AND author_id = @author_id
+      AND type = 'comment'
+      AND created_at >= @since
+      AND char_length(btrim(content)) >= @min_body_chars::int
+) AS commented;
+
 -- name: HasAgentRepliedInThread :one
 -- Returns true if the given agent has posted a reply in the thread rooted at
 -- the specified parent comment. Used to detect agent participation in a

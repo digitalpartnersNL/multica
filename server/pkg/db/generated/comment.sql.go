@@ -440,6 +440,48 @@ func (q *Queries) HasAgentRepliedInThread(ctx context.Context, arg HasAgentRepli
 	return has_replied, err
 }
 
+const hasSubstantiveAgentCommentSince = `-- name: HasSubstantiveAgentCommentSince :one
+SELECT EXISTS (
+    SELECT 1 FROM comment
+    WHERE issue_id = $1
+      AND author_type = 'agent'
+      AND author_id = $2
+      AND type = 'comment'
+      AND created_at >= $3
+      AND char_length(btrim(content)) >= $4::int
+) AS commented
+`
+
+type HasSubstantiveAgentCommentSinceParams struct {
+	IssueID      pgtype.UUID        `json:"issue_id"`
+	AuthorID     pgtype.UUID        `json:"author_id"`
+	Since        pgtype.Timestamptz `json:"since"`
+	MinBodyChars int32              `json:"min_body_chars"`
+}
+
+// HG-5 / DP-1909 (plan.0071 D1): reports whether the agent posted a
+// SUBSTANTIVE comment row on the issue at/after the run's started_at.
+// Substantive = type 'comment' (not system / status_change /
+// progress_update) with a trimmed body of at least @min_body_chars.
+// CLI comments posted through /issues/{id}/comments carry
+// source_task_id = the running task's id, so a same-task comment is the
+// strongest form of evidence; comments the platform itself synthesizes
+// at completion time (fallback from final output) land AFTER
+// completed_at and are stamped with this task's id too, which is why
+// the gate must run BEFORE the completion transaction flips the status
+// and before CompleteTask synthesizes anything.
+func (q *Queries) HasSubstantiveAgentCommentSince(ctx context.Context, arg HasSubstantiveAgentCommentSinceParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasSubstantiveAgentCommentSince,
+		arg.IssueID,
+		arg.AuthorID,
+		arg.Since,
+		arg.MinBodyChars,
+	)
+	var commented bool
+	err := row.Scan(&commented)
+	return commented, err
+}
+
 const listChildCommentsForParents = `-- name: ListChildCommentsForParents :many
 SELECT id, issue_id, author_type, author_id, content, type, created_at, updated_at, parent_id, workspace_id, resolved_at, resolved_by_type, resolved_by_id, source_task_id, quick_action_id FROM comment
 WHERE parent_id = ANY($1::uuid[])

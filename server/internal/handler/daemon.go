@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -2981,7 +2982,7 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 
 	// Verify the caller owns this task's workspace.
-	_, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
+	taskRow, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
 	if !ok {
 		return
 	}
@@ -3017,6 +3018,70 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 			RetiredSessionID:      req.RetiredSessionID,
 		})
 		return
+	}
+
+	// HG-5 / DP-1909 (plan.0071 D1): comment-plicht gate. An issue run that
+	// reaches /complete without a substantive agent comment on its issue
+	// "succeeds" while its result never reaches the reader — the run's final
+	// output only exists in the execution log. Re-route it to the failure
+	// path with a dedicated reason, exactly like the context-exhaustion
+	// normalization above: the daemon reports success, the platform
+	// re-classifies at the boundary.
+	//
+	// Substantive (G3b): a type='comment' row by this task's agent on this
+	// task's issue, at/after started_at, body ≥ 30 trimmed chars. System /
+	// status / progress rows and trivial bodies ("OK", "done") do not count;
+	// neither does the completion-time synthesized fallback, which lands
+	// after this check runs.
+	//
+	// Exemptions (X5):
+	//   - COMMENT_PFLICHT_GATE=off env killswitch (whole-workspace out)
+	//   - issue metadata {"comment_plicht_exempt": true} (per-issue opt-out
+	//     for read-only / monitoring runs that legitimately end silent)
+	//   - squad-leader no_action evaluations (recorded deliberately silent)
+	//   - tasks with no IssueID (chat / quick-create) — nothing to comment on
+	//
+	// Fail-closed: if the gate cannot VERIFY the comment state (DB read
+	// error), the run is recorded as failed rather than passing silently —
+	// a verification gap must not degrade the gate.
+	if h.commentPlichtGateEnabled() && taskRow.IssueID.Valid {
+		exempt, err := h.commentPlichtExempt(r.Context(), taskRow)
+		if err != nil {
+			slog.Error("comment-plicht gate: exemption lookup failed; failing closed",
+				"task_id", taskID, "error", err)
+			exempt = false
+		}
+		if !exempt {
+			substantive, err := h.Queries.HasSubstantiveAgentCommentSince(r.Context(), db.HasSubstantiveAgentCommentSinceParams{
+				IssueID:      taskRow.IssueID,
+				AuthorID:     taskRow.AgentID,
+				Since:        taskRow.StartedAt,
+				MinBodyChars: commentPlichtMinBodyChars,
+			})
+			if err != nil {
+				slog.Error("comment-plicht gate: comment verification failed; failing closed",
+					"task_id", taskID, "error", err)
+				substantive = false
+			}
+			if !substantive {
+				slog.Warn("comment-plicht gate: run completed without a substantive final comment; recording as failed",
+					"task_id", taskID,
+					"issue_id", uuidToString(taskRow.IssueID),
+					"agent_id", uuidToString(taskRow.AgentID),
+					"failure_reason", taskfailure.ReasonMissingFinalComment,
+					"min_body_chars", commentPlichtMinBodyChars,
+				)
+				h.failTask(w, r, taskID, workspaceID, TaskFailRequest{
+					Error:                 fmt.Sprintf("comment-plicht (HG-5/DP-1909): run finished without posting a substantive final comment (≥%d chars, type=comment) on issue %s. Post the result via `multica issue comment add` before completing the run.", commentPlichtMinBodyChars, uuidToString(taskRow.IssueID)),
+					FailureReason:         string(taskfailure.ReasonMissingFinalComment),
+					SessionID:             req.SessionID,
+					WorkDir:               req.WorkDir,
+					SessionRolloutMissing: req.SessionRolloutMissing,
+					RetiredSessionID:      req.RetiredSessionID,
+				})
+				return
+			}
+		}
 	}
 
 	result, _ := json.Marshal(req)
@@ -3062,6 +3127,75 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("task completed", "task_id", taskID, "agent_id", uuidToString(task.AgentID))
 	writeJSON(w, http.StatusOK, taskToResponse(*task, workspaceID))
+}
+
+// ---------------------------------------------------------------------------
+// Comment-plicht gate (HG-5 / DP-1909, plan.0071 D1)
+// ---------------------------------------------------------------------------
+
+// commentPlichtMinBodyChars is the G3b triviality threshold: a final comment
+// must carry at least this many trimmed characters to count as substantive.
+// 30 matches the plan.0071 testplan (G3a/G3b) and B3-besluit 4.
+const commentPlichtMinBodyChars = 30
+
+// commentPlichtExemptMetadataKey is the per-issue opt-out in issue.metadata.
+// Set to true for read-only / monitoring runs that legitimately end silent
+// (plan.0071 X5: the gate must not fail read-only runs).
+const commentPlichtExemptMetadataKey = "comment_plicht_exempt"
+
+// commentPlichtGateEnabled reports whether the comment-plicht gate is armed.
+// Fail-closed default: enabled unless COMMENT_PFLICHT_GATE explicitly equals
+// "off"/"false"/"0". An unset or unrecognized value leaves the gate ON — an
+// operator who typos the killswitch must not silently disable a hard rule.
+func (h *Handler) commentPlichtGateEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("COMMENT_PFLICHT_GATE"))) {
+	case "off", "false", "0":
+		return false
+	default:
+		return true
+	}
+}
+
+// commentPlichtExempt reports whether this task is exempt from the
+// comment-plicht gate. Exemptions (plan.0071 X5):
+//
+//   - squad-leader no_action evaluations: the run's whole purpose was to
+//     record a deliberate "no action" verdict, which is itself the result;
+//   - issue metadata {"comment_plicht_exempt": true}: per-issue opt-out for
+//     read-only / monitoring runs (the documented escape hatch for runs
+//     that legitimately complete without a reportable outcome).
+//
+// Any DB error is returned so the caller can fail closed.
+func (h *Handler) commentPlichtExempt(ctx context.Context, task db.AgentTaskQueue) (bool, error) {
+	if !task.IssueID.Valid {
+		// Chat / quick-create tasks have no issue thread to comment on.
+		return true, nil
+	}
+	noAction, err := service.HasSquadLeaderNoActionEvaluationForTask(ctx, h.Queries, task)
+	if err != nil {
+		return false, err
+	}
+	if noAction {
+		return true, nil
+	}
+	issue, err := h.Queries.GetIssue(ctx, task.IssueID)
+	if err != nil {
+		return false, err
+	}
+	if len(issue.Metadata) == 0 {
+		return false, nil
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(issue.Metadata, &meta); err != nil {
+		// Unparseable metadata is not an exemption.
+		return false, nil
+	}
+	v, ok := meta[commentPlichtExemptMetadataKey]
+	if !ok {
+		return false, nil
+	}
+	flag, ok := v.(bool)
+	return ok && flag, nil
 }
 
 // emitIssueExecutedOnFirstCompletion atomically flips issue.first_executed_at
